@@ -4,6 +4,7 @@ import Foundation
 final class ParakeetEngine {
     private var manager: AsrManager?
     private var models: AsrModels?
+    private var loadingTask: Task<(AsrModels, AsrManager), Error>?
 
     static func isModelDownloaded() -> Bool {
         let directory = AsrModels.defaultCacheDirectory(for: .v3)
@@ -14,37 +15,65 @@ final class ParakeetEngine {
         )
     }
 
+    /// Loads Parakeet once. Concurrent callers, such as the launch warm-up and
+    /// a recording started before it finished, share one load instead of each
+    /// compiling and loading the Core ML models on their own.
     func prepare(progressHandler: ModelProgressHandler? = nil) async throws {
         guard manager == nil else {
             progressHandler?(.init(fractionCompleted: 1, status: "Ready"))
             return
         }
 
-        progressHandler?(.init(fractionCompleted: 0.01, status: "Checking model…"))
-        let loadedModels = try await AsrModels.downloadAndLoad(
-            version: .v3
-        ) { progress in
-            let status: String
-            switch progress.phase {
-            case .listing:
-                status = "Checking model files…"
-            case let .downloading(completedFiles, totalFiles):
-                status = "Downloading file \(min(completedFiles + 1, totalFiles)) of \(totalFiles)…"
-            case .compiling:
-                status = "Optimizing for this Mac…"
+        let task: Task<(AsrModels, AsrManager), Error>
+        if let loadingTask {
+            task = loadingTask
+            progressHandler?(.init(fractionCompleted: 0.98, status: "Loading model…"))
+        } else {
+            progressHandler?(.init(fractionCompleted: 0.01, status: "Checking model…"))
+            task = Task(priority: .userInitiated) {
+                let loadedModels = try await AsrModels.downloadAndLoad(
+                    version: .v3
+                ) { progress in
+                    let status: String
+                    switch progress.phase {
+                    case .listing:
+                        status = "Checking model files…"
+                    case let .downloading(completedFiles, totalFiles):
+                        status = "Downloading file \(min(completedFiles + 1, totalFiles)) of \(totalFiles)…"
+                    case .compiling:
+                        status = "Optimizing for this Mac…"
+                    }
+                    progressHandler?(
+                        .init(
+                            fractionCompleted: min(0.96, max(0.02, progress.fractionCompleted)),
+                            status: status
+                        )
+                    )
+                }
+                progressHandler?(.init(fractionCompleted: 0.97, status: "Loading model…"))
+                let newManager = AsrManager(config: .default)
+                try await newManager.loadModels(loadedModels)
+                return (loadedModels, newManager)
             }
-            progressHandler?(
-                .init(
-                    fractionCompleted: min(0.96, max(0.02, progress.fractionCompleted)),
-                    status: status
-                )
-            )
+            loadingTask = task
         }
-        progressHandler?(.init(fractionCompleted: 0.97, status: "Loading model…"))
-        let newManager = AsrManager(config: .default)
-        try await newManager.loadModels(loadedModels)
-        models = loadedModels
-        manager = newManager
+
+        let loaded: (AsrModels, AsrManager)
+        do {
+            loaded = try await task.value
+        } catch {
+            if manager == nil { loadingTask = nil }
+            throw error
+        }
+
+        // Install before honouring cancellation so a finished load is never
+        // thrown away because one of its waiters gave up.
+        if manager == nil {
+            models = loaded.0
+            manager = loaded.1
+        }
+        loadingTask = nil
+        try Task.checkCancellation()
         progressHandler?(.init(fractionCompleted: 1, status: "Ready"))
     }
 

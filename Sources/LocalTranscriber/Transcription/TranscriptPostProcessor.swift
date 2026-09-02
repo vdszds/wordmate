@@ -82,7 +82,7 @@ actor TranscriptPostProcessor {
     private var callRecords: [PostProcessingCallRecord] = []
 
     nonisolated static func isModelDownloaded(_ model: PostProcessingModel) -> Bool {
-        let configuration = configuration(for: model)
+        let configuration = remoteConfiguration(for: model)
         let directory = configuration.modelDirectory(hub: makeHub())
         let requiredFiles = [
             "config.json",
@@ -142,7 +142,7 @@ actor TranscriptPostProcessor {
             .init(fractionCompleted: 0.01, status: "Checking \(model.displayName)…")
         )
         let hub = Self.makeHub()
-        let configuration = Self.configuration(for: model)
+        let configuration = Self.loadingConfiguration(for: model)
         let task = Task(priority: .userInitiated) {
             try await LLMModelFactory.shared.loadContainer(
                 hub: hub,
@@ -516,48 +516,59 @@ actor TranscriptPostProcessor {
         operationID: UUID,
         progressHandler: ModelProgressHandler?
     ) async throws {
+        let loadedContainer: ModelContainer
         do {
-            let loadedContainer = try await task.value
-            try Task.checkCancellation()
-
-            if loadedModel == model, modelContainer != nil {
-                progressHandler?(.init(fractionCompleted: 1, status: "Ready"))
-                return
-            }
-            guard loadingOperationID == operationID,
-                  loadingModel == model else {
-                throw CancellationError()
-            }
-
-            modelContainer = loadedContainer
-            loadedModel = model
-            loadingTask = nil
-            loadingModel = nil
-            loadingOperationID = nil
-            progressHandler?(.init(fractionCompleted: 1, status: "Ready"))
+            loadedContainer = try await task.value
         } catch is CancellationError {
-            if loadingOperationID == operationID {
-                loadingTask = nil
-                loadingModel = nil
-                loadingOperationID = nil
-            }
+            // The load itself was cancelled: an unload or a different model.
+            clearLoadingState(ifOperation: operationID)
             throw CancellationError()
         } catch {
-            if loadingOperationID == operationID {
-                loadingTask = nil
-                loadingModel = nil
-                loadingOperationID = nil
-            }
+            clearLoadingState(ifOperation: operationID)
             throw LocalTranscriberError.modelCouldNotLoad(
                 "\(model.displayName) could not be prepared. \(error.localizedDescription)"
             )
         }
+
+        // Install the finished model even if this particular caller was
+        // cancelled while waiting. Other callers, and the next recording, still
+        // need it; discarding a completed load only forces a reload later.
+        if loadingOperationID == operationID, loadingModel == model {
+            modelContainer = loadedContainer
+            loadedModel = model
+            clearLoadingState(ifOperation: operationID)
+        }
+
+        try Task.checkCancellation()
+        guard loadedModel == model, modelContainer != nil else {
+            throw CancellationError()
+        }
+        progressHandler?(.init(fractionCompleted: 1, status: "Ready"))
     }
 
-    private nonisolated static func configuration(
+    private func clearLoadingState(ifOperation operationID: UUID) {
+        guard loadingOperationID == operationID else { return }
+        loadingTask = nil
+        loadingModel = nil
+        loadingOperationID = nil
+    }
+
+    private nonisolated static func remoteConfiguration(
         for model: PostProcessingModel
     ) -> ModelConfiguration {
         LLMRegistry.qwen3_0_6b_4bit
+    }
+
+    /// Once the model files exist locally, load them from that directory.
+    /// A Hub-backed configuration re-lists the repository and checks every
+    /// file against the server on each load, which costs a network round trip
+    /// per launch, fails behind a firewall, and contradicts offline operation.
+    nonisolated static func loadingConfiguration(
+        for model: PostProcessingModel
+    ) -> ModelConfiguration {
+        let remote = remoteConfiguration(for: model)
+        guard isModelDownloaded(model) else { return remote }
+        return ModelConfiguration(directory: remote.modelDirectory(hub: makeHub()))
     }
 
     private nonisolated static func generationParameters(
