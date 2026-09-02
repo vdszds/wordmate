@@ -136,6 +136,115 @@ final class TranscriptPolishPolicyTests: XCTestCase {
         )
     }
 
+    func testPartialWordRetriesMayBeDeletedButAttachedTokensMayNot() {
+        // "s simply" and "typ typesetting" are visible restarts of a word.
+        XCTAssertEqual(
+            TranscriptPolishPolicy.conservativeProjection(
+                of: "Lorem Ipsum is simply dummy text of the printing and typesetting industry.",
+                for: "Lorem Ipsum is s simply dummy text of the printing and typ typesetting industry."
+            ),
+            "Lorem Ipsum is simply dummy text of the printing and typesetting industry."
+        )
+        XCTAssertTrue(
+            TranscriptPolishPolicy.isNearVerbatimRecovery(
+                "Lorem Ipsum is simply dummy text.",
+                for: "Lorem Ipsum is s simply dummy text."
+            )
+        )
+
+        // A possessive before a word starting with the same letter is not a retry.
+        XCTAssertNil(
+            TranscriptPolishPolicy.conservativeProjection(
+                of: "The industry standard dummy text.",
+                for: "The industry's standard dummy text."
+            )
+        )
+        // Nor is a hyphenated prefix.
+        XCTAssertNil(
+            TranscriptPolishPolicy.conservativeProjection(
+                of: "Please read the notes.",
+                for: "Please re-read the notes."
+            )
+        )
+        // A fluent word that merely shares letters with the next word stays protected
+        // when the model also drops unrelated words.
+        XCTAssertNil(
+            TranscriptPolishPolicy.conservativeProjection(
+                of: "This book is a treatise on theory of ethics popular during the Renaissance.",
+                for: "This book is a treatise on the theory of ethics, very popular during the Renaissance."
+            )
+        )
+    }
+
+    func testEmphasisMarkupIsStrippedInsteadOfRejected() {
+        XCTAssertEqual(
+            TranscriptPolishPolicy.conservativeProjection(
+                of: "Richard looked up the Latin word *consectur* from a passage.",
+                for: "Richard looked up the Latin word consectur from a passage."
+            ),
+            "Richard looked up the Latin word consectur from a passage."
+        )
+        XCTAssertEqual(
+            TranscriptPolishPolicy.strippingEmphasisMarkup(
+                from: "Keep _this_ and snake_case_name.",
+                absentFrom: "Keep this and snake case name."
+            ),
+            "Keep this and snake_case_name."
+        )
+    }
+
+    func testModelInsertedSentenceBreaksBeforeLowercaseWordsAreRemoved() {
+        XCTAssertEqual(
+            TranscriptPolishPolicy.conservativeProjection(
+                of: "Lorem Ipsum is simply dummy text. of the printing industry.",
+                for: "Lorem Ipsum Ipsum is simply dummy text text of the printing industry."
+            ),
+            "Lorem Ipsum is simply dummy text of the printing industry."
+        )
+        // Source-owned periods and abbreviations stay untouched.
+        XCTAssertEqual(
+            TranscriptPolishPolicy.removingInsertedSentenceBreaks(
+                from: "See section 1.10.32, e.g. the first line. the next one.",
+                for: "See section 1.10.32, e.g. the first line. the next one."
+            ),
+            "See section 1.10.32, e.g. the first line. the next one."
+        )
+    }
+
+    func testFallbackChunksNeverGainSentenceBoundariesAtSeams() {
+        XCTAssertEqual(
+            TranscriptPolishPolicy.matchingSentenceBoundaries(
+                of: "The book is a treatise.",
+                to: "The book is a treatise"
+            ),
+            "The book is a treatise"
+        )
+        XCTAssertEqual(
+            TranscriptPolishPolicy.matchingSentenceBoundaries(
+                of: "On the theory of ethics, very popular during the Renaissance.",
+                to: "on the theory of ethics very popular during the Renaissance."
+            ),
+            "on the theory of ethics, very popular during the Renaissance."
+        )
+        XCTAssertEqual(
+            TranscriptPolishPolicy.matchingSentenceBoundaries(
+                of: "The book is a treatise.",
+                to: "The book is a treatise."
+            ),
+            "The book is a treatise."
+        )
+
+        let firstSentence = "Lorem Ipsum is simply dummy text of the printing and typesetting industry."
+        let secondSentence = Array(repeating: "spoken", count: 60).joined(separator: " ") + "."
+        let chunks = TranscriptPolishPolicy.fallbackChunks(from: "\(firstSentence) \(secondSentence)")
+        XCTAssertEqual(chunks.first, firstSentence)
+        XCTAssertGreaterThan(chunks.count, 2)
+        XCTAssertEqual(
+            chunks.joined(separator: " ").split(whereSeparator: \.isWhitespace).count,
+            firstSentence.split(whereSeparator: \.isWhitespace).count + 60
+        )
+    }
+
     func testNearVerbatimRecoveryAcceptsOnlySurgicalDisfluencyEdits() {
         XCTAssertTrue(
             TranscriptPolishPolicy.containsImmediateRepeatedSpeech(

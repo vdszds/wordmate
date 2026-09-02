@@ -2,22 +2,216 @@ import XCTest
 @testable import LocalTranscriber
 
 final class StreamingTranscriptPolisherTests: XCTestCase {
-    func testReconcilerReturnsOnlyUnprocessedFinalWords() {
-        let suffix = StreamingTranscriptReconciler.unprocessedSuffix(
-            in: "Hello, world. This is the final sentence.",
-            afterProcessedPrefix: "hello WORLD"
-        )
+    func testEmissionTrackerEmitsOnlyNewSentencesInOrder() {
+        var tracker = StreamingEmissionTracker()
 
-        XCTAssertEqual(suffix, "This is the final sentence.")
+        let first = tracker.newRanges(in: "First sentence is here. Second sentence follows.")
+        XCTAssertEqual(first.map(\.source), ["First sentence is here. Second sentence follows."])
+
+        let second = tracker.newRanges(
+            in: "First sentence is here. Second sentence follows. Third sentence arrives now."
+        )
+        XCTAssertEqual(second.map(\.source), ["Third sentence arrives now."])
+        XCTAssertEqual(second.first?.precedingContext, "First sentence is here. Second sentence follows.")
+
+        let unchanged = tracker.newRanges(
+            in: "First sentence is here. Second sentence follows. Third sentence arrives now."
+        )
+        XCTAssertTrue(unchanged.isEmpty)
     }
 
-    func testReconcilerRejectsAChangedProcessedPrefix() {
+    func testEmissionTrackerReemitsOnlyARevisedSentence() {
+        var tracker = StreamingEmissionTracker()
+        _ = tracker.newRanges(
+            in: "First sentence is here. Second sentence follows. Third sentence arrives now."
+        )
+
+        let revised = tracker.newRanges(
+            in: "First sentence is here. Second sentence changed. Third sentence arrives now. Fourth one."
+        )
+        XCTAssertEqual(
+            revised.map(\.source),
+            ["Second sentence changed.", "Fourth one."]
+        )
+        XCTAssertEqual(
+            tracker.emittedSegments,
+            [
+                "First sentence is here.",
+                "Second sentence changed.",
+                "Third sentence arrives now.",
+                "Fourth one.",
+            ]
+        )
+
+        // Emission continues after the revision instead of stopping for the
+        // rest of the recording.
+        let later = tracker.newRanges(
+            in: "First sentence is here. Second sentence changed. Third sentence arrives now. Fourth one. Fifth sentence."
+        )
+        XCTAssertEqual(later.map(\.source), ["Fifth sentence."])
+    }
+
+    func testCommittedSentencePrefixHoldsSentencesNearTheSnapshotEdge() {
+        XCTAssertEqual(
+            StreamingTranscriptPolicy.committedSentencePrefix(
+                of: "First sentence. Second sentence. Third sentence is unfinished",
+                minimumTrailingWords: 3
+            ),
+            "First sentence. Second sentence."
+        )
+        XCTAssertEqual(
+            StreamingTranscriptPolicy.committedSentencePrefix(
+                of: "First sentence. Second sentence. It.",
+                minimumTrailingWords: 3
+            ),
+            "First sentence."
+        )
+        XCTAssertEqual(
+            StreamingTranscriptPolicy.committedSentencePrefix(
+                of: "Only one sentence here.",
+                minimumTrailingWords: 3
+            ),
+            ""
+        )
+        XCTAssertEqual(
+            StreamingTranscriptPolicy.committedSentencePrefix(
+                of: "Sections 1.10.32 and 1.10.33 were cited. Then more words",
+                minimumTrailingWords: 3
+            ),
+            "Sections 1.10.32 and 1.10.33 were cited."
+        )
+    }
+
+    func testShortFragmentsJoinTheFollowingSentence() async {
+        let processor = RecordingTranscriptPolisher()
+        let pipeline = StreamingTranscriptPolisher(
+            isEnabled: true,
+            model: .qwen3_0_6b,
+            processor: processor
+        )
+
+        await pipeline.consumeStableSegment(
+            "The librarian worked at the printing library in London."
+        )
+        await pipeline.consumeStableSegment("Bridge Brid St.")
+        await pipeline.waitForQueuedWork()
+        let callsBeforeMerge = await processor.streamingCalls
+        XCTAssertEqual(callsBeforeMerge.count, 1)
+
+        await pipeline.consumeStableSegment("Bride Library took a translation and scrambled it.")
+        await pipeline.waitForQueuedWork()
+
+        let calls = await processor.streamingCalls
+        XCTAssertEqual(
+            calls.map(\.transcript),
+            [
+                "The librarian worked at the printing library in London.",
+                "Bridge Brid St. Bride Library took a translation and scrambled it.",
+            ]
+        )
+        XCTAssertEqual(
+            StreamingTranscriptPolicy.sentenceSegments(
+                in: "At St. Bride we met. Then we left.",
+                mergingSegmentsShorterThan: 4
+            ),
+            ["At St. Bride we met.", "Then we left."]
+        )
+    }
+
+    func testTextFollowingCommittedTextExtractsTheTail() {
+        let committed = "Lorem Ipsum is simply dummy text. It has survived not only many decades."
+        XCTAssertEqual(
+            StreamingTranscriptReconciler.textFollowing(
+                committedText: committed,
+                in: "vived not only many decades. But also the leap into electronic typesetting."
+            ),
+            "But also the leap into electronic typesetting."
+        )
         XCTAssertNil(
-            StreamingTranscriptReconciler.unprocessedSuffix(
-                in: "Hello different world. This is the tail.",
-                afterProcessedPrefix: "Hello quiet world."
+            StreamingTranscriptReconciler.textFollowing(
+                committedText: committed,
+                in: "completely different words appear in this window."
             )
         )
+        XCTAssertNil(
+            StreamingTranscriptReconciler.textFollowing(
+                committedText: committed,
+                in: "not only many decades."
+            )
+        )
+    }
+
+    func testTerminalRangePolishesShortAndUnfinishedTextImmediately() async {
+        let processor = RecordingTranscriptPolisher()
+        let pipeline = StreamingTranscriptPolisher(
+            isEnabled: true,
+            model: .qwen3_0_6b,
+            processor: processor
+        )
+
+        await pipeline.consumeStableSegment(
+            StreamingStableRange(
+                source: "Thank you",
+                precedingContext: "That is everything I wanted to say.",
+                followingContext: "",
+                isTerminal: true
+            )
+        )
+        await pipeline.waitForQueuedWork()
+
+        let calls = await processor.streamingCalls
+        XCTAssertEqual(calls.map(\.transcript), ["Thank you"])
+        XCTAssertEqual(calls.first?.precedingContext, "That is everything I wanted to say.")
+    }
+
+    func testAnchorsRequireMatchingSentenceBoundaries() async {
+        let processor = RecordingTranscriptPolisher()
+        let pipeline = StreamingTranscriptPolisher(
+            isEnabled: true,
+            model: .qwen3_0_6b,
+            processor: processor
+        )
+
+        await pipeline.consumeStableSegment("The book is a treatise.")
+        await pipeline.consumeStableSegment("The first line comes from section one.")
+        let final = "The book is a treatise on the theory of ethics. The first line comes from section one."
+        let result = await pipeline.finalize(rawTranscript: final)
+
+        // "The book is a treatise." was cut mid-sentence; its polished copy
+        // must not be reused ahead of "on the theory of ethics".
+        XCTAssertEqual(result.transcript, final)
+        XCTAssertEqual(result.finalizationDiagnostics.strategy, .anchoredRanges)
+        XCTAssertEqual(result.finalizationDiagnostics.reusedSegmentCount, 1)
+        XCTAssertEqual(result.finalizationDiagnostics.reprocessedWordCount, 10)
+
+        let calls = await processor.streamingCalls
+        XCTAssertEqual(calls.last?.transcript, "The book is a treatise on the theory of ethics.")
+    }
+
+    func testRevisedSentenceEmittedLaterIsReusedInTranscriptOrder() async {
+        let processor = RecordingTranscriptPolisher()
+        let pipeline = StreamingTranscriptPolisher(
+            isEnabled: true,
+            model: .qwen3_0_6b,
+            processor: processor
+        )
+
+        await pipeline.consumeStableSegment("The draft color is blue today.")
+        await pipeline.consumeStableSegment("Last sentence remains exactly.")
+        await pipeline.consumeStableSegment(
+            StreamingStableRange(
+                source: "The final color is green today.",
+                precedingContext: "",
+                followingContext: "Last sentence remains exactly."
+            )
+        )
+
+        let final = "The final color is green today. Last sentence remains exactly."
+        let result = await pipeline.finalize(rawTranscript: final)
+
+        XCTAssertEqual(result.transcript, final)
+        XCTAssertEqual(result.finalizationDiagnostics.reusedSegmentCount, 2)
+        XCTAssertEqual(result.finalizationDiagnostics.reprocessedRangeCount, 0)
     }
 
     func testCompletedSegmentIsPolishedDuringRecordingAndTailAtRelease() async {
@@ -66,10 +260,12 @@ final class StreamingTranscriptPolisherTests: XCTestCase {
         )
 
         await pipeline.consumeStableSegment("We should deploy on Thursday sorry")
+        await pipeline.waitForQueuedWork()
         let callsBeforeLookAhead = await processor.streamingCalls
         XCTAssertTrue(callsBeforeLookAhead.isEmpty)
 
         await pipeline.consumeStableSegment("I mean Friday after after the tests pass.")
+        await pipeline.waitForQueuedWork()
 
         let calls = await processor.streamingCalls
         XCTAssertEqual(calls.count, 2)
@@ -90,14 +286,15 @@ final class StreamingTranscriptPolisherTests: XCTestCase {
         )
 
         await pipeline.consumeStableSegment(
-            "First first sentence. Second second sentence."
+            "First first sentence is here. Second second sentence is here."
         )
+        await pipeline.waitForQueuedWork()
 
         let calls = await processor.streamingCalls
         XCTAssertEqual(calls.count, 2)
-        XCTAssertEqual(calls[0].transcript, "First first sentence.")
-        XCTAssertEqual(calls[1].transcript, "Second second sentence.")
-        XCTAssertEqual(calls[0].followingContext, "Second second sentence.")
+        XCTAssertEqual(calls.first?.transcript, "First first sentence is here.")
+        XCTAssertEqual(calls.last?.transcript, "Second second sentence is here.")
+        XCTAssertEqual(calls.first?.followingContext, "Second second sentence is here.")
     }
 
     func testFinalRevisionFallsBackToWholeTranscript() async {
@@ -212,65 +409,12 @@ final class StreamingTranscriptPolisherTests: XCTestCase {
         )
     }
 
-    func testStablePrefixAlwaysHoldsTheNewestSentence() {
-        XCTAssertEqual(
-            StreamingTranscriptPolicy.stablePrefix(
-                of: "First sentence. Second sentence. Third sentence is unfinished"
-            ),
-            "First sentence."
-        )
-        XCTAssertEqual(
-            StreamingTranscriptPolicy.stablePrefix(
-                of: "First sentence. Second sentence."
-            ),
-            "First sentence."
-        )
-        XCTAssertEqual(
-            StreamingTranscriptPolicy.stablePrefix(of: "Only one sentence."),
-            ""
-        )
-    }
-
-    func testCompleteSentencePrefixUsesNewestConfirmedBoundary() {
-        XCTAssertEqual(
-            StreamingTranscriptPolicy.completeSentencePrefix(
-                of: "First sentence. Second sentence. Third sentence is unfinished"
-            ),
-            "First sentence. Second sentence."
-        )
-        XCTAssertEqual(
-            StreamingTranscriptPolicy.completeSentencePrefix(
-                of: "Only an unfinished sentence"
-            ),
-            ""
-        )
+    func testSentenceSegmentsSplitAtStrongBoundaries() {
         XCTAssertEqual(
             StreamingTranscriptPolicy.sentenceSegments(
                 in: "First sentence. Second sentence! Last fragment"
             ),
             ["First sentence.", "Second sentence!", "Last fragment"]
-        )
-    }
-
-    func testConfirmedPrefixUsesConsecutiveSnapshotsAndHoldsBackWords() {
-        let previous = "Alpha beta gamma delta epsilon zeta eta theta iota kappa."
-        let current = previous + " Lambda mu nu."
-
-        XCTAssertEqual(
-            StreamingTranscriptReconciler.confirmedPrefix(
-                in: current,
-                against: previous,
-                holdingBack: 3
-            ),
-            "Alpha beta gamma delta epsilon zeta eta"
-        )
-        XCTAssertEqual(
-            StreamingTranscriptReconciler.confirmedPrefix(
-                in: "Alpha beta changed delta epsilon zeta eta theta.",
-                against: previous,
-                holdingBack: 3
-            ),
-            ""
         )
     }
 

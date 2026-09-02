@@ -30,13 +30,15 @@ actor ModelRunner {
     func transcribeStreaming(
         _ audioChunks: AsyncStream<LiveAudioChunk>,
         using engine: EngineChoice,
-        onStableSegment: @escaping @Sendable (String) async -> Void
+        onStableSegment: @escaping @Sendable (StreamingStableRange) async -> Void,
+        onCheckpoint: (@Sendable (StreamingCheckpointEvent) -> Void)? = nil
     ) async throws -> String {
         switch engine {
         case .parakeet:
             return try await parakeet.transcribeStreaming(
                 audioChunks,
-                onStableSegment: onStableSegment
+                onStableSegment: onStableSegment,
+                onCheckpoint: onCheckpoint
             )
         }
     }

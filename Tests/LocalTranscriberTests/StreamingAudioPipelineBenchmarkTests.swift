@@ -26,6 +26,9 @@ final class StreamingAudioPipelineBenchmarkTests: XCTestCase {
         let releaseToFinalDuration: Double
         let stableMetrics: StreamingEventMetrics.Snapshot
         let finalizationDiagnostics: StreamingFinalizationDiagnostics
+        let callRecords: [PostProcessingCallRecord]
+        let checkpoints: [StreamingCheckpointEvent]
+        let releasedAt: ContinuousClock.Instant
     }
 
     func testAudioSetThroughProductionStreamingPipeline() async throws {
@@ -179,6 +182,8 @@ final class StreamingAudioPipelineBenchmarkTests: XCTestCase {
                 )
                 print("RAW_WER_PERCENT=\(format(rawWER * 100))")
                 print("POLISHED_WER_PERCENT=\(format(polishedWER * 100))")
+                printCallRecords(result.callRecords, releasedAt: result.releasedAt)
+                printCheckpoints(result.checkpoints, releasedAt: result.releasedAt)
 
                 if shouldPrintTranscripts {
                     print("RAW_TRANSCRIPT_BEGIN")
@@ -233,6 +238,7 @@ final class StreamingAudioPipelineBenchmarkTests: XCTestCase {
         let clock = ContinuousClock()
         let audioDuration = Double(samples.count) / AudioSampleLoader.sampleRate
         let metrics = StreamingEventMetrics()
+        let checkpointLog = CheckpointLog()
         let polisher = StreamingTranscriptPolisher(
             isEnabled: true,
             model: .qwen3_0_6b,
@@ -253,11 +259,11 @@ final class StreamingAudioPipelineBenchmarkTests: XCTestCase {
                 try await runner.transcribeStreaming(
                     stream,
                     using: .parakeet
-                ) { stableSegment in
+                ) { stableRange in
                     let stableStartedAt = benchmarkSeconds(
                         replayStarted.duration(to: clock.now)
                     )
-                    await polisher.consumeStableSegment(stableSegment)
+                    await polisher.consumeStableSegment(stableRange)
                     let stableFinishedAt = benchmarkSeconds(
                         replayStarted.duration(to: clock.now)
                     )
@@ -265,6 +271,8 @@ final class StreamingAudioPipelineBenchmarkTests: XCTestCase {
                         startedAt: stableStartedAt,
                         finishedAt: stableFinishedAt
                     )
+                } onCheckpoint: { event in
+                    checkpointLog.append(event)
                 }
             )
             let rawCompletedAt = benchmarkSeconds(
@@ -298,10 +306,13 @@ final class StreamingAudioPipelineBenchmarkTests: XCTestCase {
             offset = end
         }
 
-        let releasedAt = benchmarkSeconds(replayStarted.duration(to: clock.now))
+        let releasedInstant = clock.now
+        let releasedAt = benchmarkSeconds(replayStarted.duration(to: releasedInstant))
         continuation.finish()
         let completion = try await pipelineTask.value
         let stableMetrics = await metrics.snapshot(releasedAt: releasedAt)
+        let callRecords = await processor.drainCallRecords()
+        let checkpoints = checkpointLog.events
 
         return RunResult(
             rawTranscript: completion.result.rawTranscript,
@@ -319,8 +330,112 @@ final class StreamingAudioPipelineBenchmarkTests: XCTestCase {
                 completion.finalCompletedAt - releasedAt
             ),
             stableMetrics: stableMetrics,
-            finalizationDiagnostics: completion.result.finalizationDiagnostics
+            finalizationDiagnostics: completion.result.finalizationDiagnostics,
+            callRecords: callRecords,
+            checkpoints: checkpoints,
+            releasedAt: releasedInstant
         )
+    }
+
+    private func printCheckpoints(
+        _ events: [StreamingCheckpointEvent],
+        releasedAt: ContinuousClock.Instant
+    ) {
+        let checkpoints = events.filter { $0.kind == .checkpoint }
+        let inFlightAtRelease = checkpoints.contains {
+            $0.startedAt < releasedAt && $0.finishedAt > releasedAt
+        }
+        if let tail = events.first(where: { $0.kind == .speculativeTail }) {
+            print("PARAKEET_SPECULATIVE_TAIL_SECONDS=\(format(tail.transcriptionSeconds))")
+        } else {
+            print("PARAKEET_SPECULATIVE_TAIL_SECONDS=none")
+        }
+        let checkpointSeconds = checkpoints.reduce(0.0) { $0 + $1.transcriptionSeconds }
+        print("PARAKEET_CHECKPOINTS=\(checkpoints.count)")
+        print("PARAKEET_CHECKPOINT_SECONDS=\(format(checkpointSeconds))")
+        print("PARAKEET_CHECKPOINT_IN_FLIGHT_AT_RELEASE=\(inFlightAtRelease)")
+        if let last = checkpoints.last {
+            print("PARAKEET_LAST_CHECKPOINT_AUDIO_SECONDS=\(format(last.audioSeconds))")
+            print("PARAKEET_LAST_CHECKPOINT_SECONDS=\(format(last.transcriptionSeconds))")
+        }
+        if let finalPass = events.first(where: { $0.kind == .finalPass }) {
+            print("PARAKEET_FINAL_PASS_SECONDS=\(format(finalPass.transcriptionSeconds))")
+            print(
+                "PARAKEET_FINAL_PASS_STARTED_AFTER_RELEASE_SECONDS=\(format(benchmarkSeconds(releasedAt.duration(to: finalPass.startedAt))))"
+            )
+        }
+    }
+
+    /// Prints every Qwen call of a run, then a per-stage summary split by
+    /// whether the call finished before or after Fn was released.
+    private func printCallRecords(
+        _ records: [PostProcessingCallRecord],
+        releasedAt: ContinuousClock.Instant
+    ) {
+        var afterReleaseSeconds = 0.0
+        var beforeReleaseSeconds = 0.0
+        var stageTotals: [String: (count: Int, seconds: Double)] = [:]
+        var outcomeTotals: [String: Int] = [:]
+        var promptSeconds = 0.0
+        var generationSeconds = 0.0
+        var reusedPromptTokens = 0
+        var promptTokens = 0
+
+        print("QWEN_CALLS_BEGIN")
+        for record in records {
+            let startedAfterRelease = record.startedAt >= releasedAt
+            let phase: String
+            if startedAfterRelease {
+                phase = "afterRelease"
+                afterReleaseSeconds += record.totalSeconds
+            } else if record.finishedAt > releasedAt {
+                phase = "spansRelease"
+                let overhang = benchmarkSeconds(releasedAt.duration(to: record.finishedAt))
+                afterReleaseSeconds += overhang
+                beforeReleaseSeconds += record.totalSeconds - overhang
+            } else {
+                phase = "beforeRelease"
+                beforeReleaseSeconds += record.totalSeconds
+            }
+            let key = record.stage.rawValue
+            let previous = stageTotals[key] ?? (0, 0)
+            stageTotals[key] = (previous.count + 1, previous.seconds + record.totalSeconds)
+            outcomeTotals[record.outcome.rawValue, default: 0] += 1
+            promptSeconds += record.promptSeconds
+            generationSeconds += record.generationSeconds
+            reusedPromptTokens += record.reusedPromptTokenCount
+            promptTokens += record.promptTokenCount
+
+            print(
+                "QWEN_CALL stage=\(record.stage.rawValue) outcome=\(record.outcome.rawValue) "
+                    + "phase=\(phase) words=\(record.sourceWordCount) "
+                    + "prompt_tokens=\(record.promptTokenCount) reused_tokens=\(record.reusedPromptTokenCount) "
+                    + "generated_tokens=\(record.generatedTokenCount) "
+                    + "prompt_seconds=\(format(record.promptSeconds)) "
+                    + "generation_seconds=\(format(record.generationSeconds)) "
+                    + "total_seconds=\(format(record.totalSeconds))"
+            )
+            if record.outcome != .accepted {
+                print("QWEN_REJECTED_SOURCE=\(record.source)")
+                print("QWEN_REJECTED_OUTPUT=\(record.output)")
+            }
+        }
+        print("QWEN_CALLS_END")
+        print("QWEN_CALL_COUNT=\(records.count)")
+        print("QWEN_CALL_SECONDS_BEFORE_RELEASE=\(format(beforeReleaseSeconds))")
+        print("QWEN_CALL_SECONDS_AFTER_RELEASE=\(format(afterReleaseSeconds))")
+        print("QWEN_PROMPT_SECONDS=\(format(promptSeconds))")
+        print("QWEN_GENERATION_SECONDS=\(format(generationSeconds))")
+        print("QWEN_PROMPT_TOKENS=\(promptTokens)")
+        print("QWEN_REUSED_PROMPT_TOKENS=\(reusedPromptTokens)")
+        for (stage, totals) in stageTotals.sorted(by: { $0.key < $1.key }) {
+            print(
+                "QWEN_STAGE stage=\(stage) calls=\(totals.count) seconds=\(format(totals.seconds))"
+            )
+        }
+        for (outcome, count) in outcomeTotals.sorted(by: { $0.key < $1.key }) {
+            print("QWEN_OUTCOME outcome=\(outcome) calls=\(count)")
+        }
     }
 
     private func wordErrorCount(_ actual: String, _ expected: String) -> Int {
@@ -356,6 +471,23 @@ final class StreamingAudioPipelineBenchmarkTests: XCTestCase {
 
     private func formatOptional(_ value: Double?) -> String {
         value.map(format) ?? "none"
+    }
+}
+
+private final class CheckpointLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [StreamingCheckpointEvent] = []
+
+    var events: [StreamingCheckpointEvent] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func append(_ event: StreamingCheckpointEvent) {
+        lock.lock()
+        storage.append(event)
+        lock.unlock()
     }
 }
 

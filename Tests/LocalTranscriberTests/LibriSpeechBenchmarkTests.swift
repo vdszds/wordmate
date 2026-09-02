@@ -292,11 +292,11 @@ final class LibriSpeechBenchmarkTests: XCTestCase {
                 try await runner.transcribeStreaming(
                     stream,
                     using: .parakeet
-                ) { stableSegment in
+                ) { stableRange in
                     let startedAt = librispeechSeconds(
                         replayStarted.duration(to: clock.now)
                     )
-                    await polisher.consumeStableSegment(stableSegment)
+                    await polisher.consumeStableSegment(stableRange)
                     let finishedAt = librispeechSeconds(
                         replayStarted.duration(to: clock.now)
                     )

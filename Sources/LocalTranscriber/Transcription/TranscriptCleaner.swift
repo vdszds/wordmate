@@ -13,6 +13,10 @@ enum TranscriptCleaner {
         text = replacing(#"\s*[,;:]\s*"# + filler + #"(?=\s*(?:[.!?]|$))"#, in: text, with: "")
         text = replacing(filler, in: text, with: " ")
 
+        // Drop unmistakable partial-word retries such as "s simply" so a
+        // stray letter or word fragment never reaches the pasted text.
+        text = PartialWordRetryCleaner.removingRetries(from: text)
+
         // Repair whitespace and punctuation left behind by the removed words.
         text = replacing(#"\s+"#, in: text, with: " ")
         text = replacing(#"\s+([,.;:!?])"#, in: text, with: "$1")

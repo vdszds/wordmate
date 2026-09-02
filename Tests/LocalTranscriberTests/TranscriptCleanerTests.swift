@@ -26,4 +26,45 @@ final class TranscriptCleanerTests: XCTestCase {
     func testFillerOnlyTranscriptBecomesEmpty() {
         XCTAssertEqual(TranscriptCleaner.clean("Um, uh."), "")
     }
+
+    func testPartialWordRetriesAreRemovedButDictionaryWordsStay() throws {
+        guard let language = SpellingDictionary.language, language.hasPrefix("en") else {
+            throw XCTSkip("Requires an English spelling language")
+        }
+
+        XCTAssertEqual(
+            TranscriptCleaner.clean(
+                "Lorem Ipsum is s simply dummy text of the typ typesetting industry."
+            ),
+            "Lorem Ipsum is simply dummy text of the typesetting industry."
+        )
+        XCTAssertEqual(
+            TranscriptCleaner.clean("He looked up the word consec consectetur, and left."),
+            "He looked up the word consectetur, and left."
+        )
+        // Chains of fragments collapse onto the completed word; "Ty" is a
+        // dictionary name and therefore stays for the model to judge.
+        XCTAssertEqual(
+            TranscriptCleaner.clean("Typ typese typesetting is fun."),
+            "typesetting is fun."
+        )
+        XCTAssertEqual(
+            TranscriptCleaner.clean("Ty typ typesetting is fun."),
+            "Ty typesetting is fun."
+        )
+        // Real words that prefix the next word are never fragments.
+        XCTAssertEqual(
+            TranscriptCleaner.clean("This is a treatise on the theory of ethics in industry."),
+            "This is a treatise on the theory of ethics in industry."
+        )
+        XCTAssertEqual(
+            TranscriptCleaner.clean("I think a about it. We went to today's meeting."),
+            "I think a about it. We went to today's meeting."
+        )
+        // Attached tokens are not fragments.
+        XCTAssertEqual(
+            TranscriptCleaner.clean("The industry's standard re-read the co-op's notes."),
+            "The industry's standard re-read the co-op's notes."
+        )
+    }
 }

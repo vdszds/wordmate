@@ -1,5 +1,6 @@
 import Foundation
 import Hub
+import MLX
 import MLXLLM
 import MLXLMCommon
 
@@ -17,12 +18,68 @@ protocol TranscriptPolishing: Sendable {
     ) async throws -> String
 }
 
+/// One language-model call made while polishing a transcript. Benchmarks read
+/// these records to attribute post-release latency to the exact prompt stages
+/// and retries that ran, instead of guessing from aggregate timings.
+struct PostProcessingCallRecord: Sendable {
+    enum Stage: String, Sendable {
+        case streaming
+        case standalone
+        case fallbackChunk
+        case recovery
+    }
+
+    enum Outcome: String, Sendable {
+        case accepted
+        case contextLeaked
+        case projectionRejected
+        case recoveryRejected
+    }
+
+    let stage: Stage
+    let outcome: Outcome
+    let sourceWordCount: Int
+    let promptTokenCount: Int
+    let reusedPromptTokenCount: Int
+    let generatedTokenCount: Int
+    let promptSeconds: Double
+    let generationSeconds: Double
+    let startedAt: ContinuousClock.Instant
+    let finishedAt: ContinuousClock.Instant
+    let source: String
+    let output: String
+
+    var totalSeconds: Double {
+        let components = startedAt.duration(to: finishedAt).components
+        return Double(components.seconds) + Double(components.attoseconds) / 1e18
+    }
+}
+
 actor TranscriptPostProcessor {
+    private enum PromptKind {
+        case polish
+        case recovery
+    }
+
+    private struct ModelResponse {
+        let candidate: String
+        let rawOutput: String
+        let promptTokenCount: Int
+        let reusedPromptTokenCount: Int
+        let generatedTokenCount: Int
+        let promptSeconds: Double
+        let generationSeconds: Double
+        let startedAt: ContinuousClock.Instant
+        let finishedAt: ContinuousClock.Instant
+    }
+
     private var modelContainer: ModelContainer?
     private var loadedModel: PostProcessingModel?
     private var loadingTask: Task<ModelContainer, Error>?
     private var loadingModel: PostProcessingModel?
     private var loadingOperationID: UUID?
+    private let promptCache = PromptPrefixCache()
+    private var callRecords: [PostProcessingCallRecord] = []
 
     nonisolated static func isModelDownloaded(_ model: PostProcessingModel) -> Bool {
         let configuration = configuration(for: model)
@@ -79,6 +136,7 @@ actor TranscriptPostProcessor {
         loadingOperationID = nil
         modelContainer = nil
         loadedModel = nil
+        promptCache.clear()
 
         progressHandler?(
             .init(fractionCompleted: 0.01, status: "Checking \(model.displayName)…")
@@ -112,6 +170,12 @@ actor TranscriptPostProcessor {
             operationID: operationID,
             progressHandler: progressHandler
         )
+    }
+
+    /// Returns and clears every model call recorded since the previous drain.
+    func drainCallRecords() -> [PostProcessingCallRecord] {
+        defer { callRecords.removeAll() }
+        return callRecords
     }
 
     func polish(
@@ -153,37 +217,36 @@ actor TranscriptPostProcessor {
             )
         }
 
-        let session = ChatSession(
-            modelContainer,
-            instructions: TranscriptPolishPolicy.instructions,
-            history: TranscriptPolishPolicy.fewShotHistory,
-            generateParameters: Self.generationParameters(transcript: transcript),
-            additionalContext: ["enable_thinking": TranscriptPolishPolicy.reasoningEnabled]
-        )
-        let response = try await session.respond(
+        let response = try await respond(
+            .polish,
             to: TranscriptPolishPolicy.streamingPrompt(
                 for: transcript,
                 precedingContext: precedingContext,
                 followingContext: followingContext
-            )
+            ),
+            source: transcript,
+            modelContainer: modelContainer
         )
-        let candidate = TranscriptPolishPolicy.cleanModelOutput(response)
 
-        if !TranscriptPolishPolicy.leaksStreamingContext(
-               candidate,
-               precedingContext: precedingContext,
-               followingContext: followingContext
-           ),
-           let candidate = TranscriptPolishPolicy.conservativeProjection(
-               of: candidate,
-               for: transcript
-           ) {
+        if TranscriptPolishPolicy.leaksStreamingContext(
+            response.candidate,
+            precedingContext: precedingContext,
+            followingContext: followingContext
+        ) {
+            record(response, stage: .streaming, outcome: .contextLeaked, source: transcript)
+        } else if let candidate = TranscriptPolishPolicy.conservativeProjection(
+            of: response.candidate,
+            for: transcript
+        ) {
+            record(response, stage: .streaming, outcome: .accepted, source: transcript)
             return candidate
+        } else {
+            record(response, stage: .streaming, outcome: .projectionRejected, source: transcript)
         }
 
         // Context-only prompting is intentionally conservative. If the small
-        // model repeats either context halo, retry the owned segment through the
-        // established standalone path rather than accepting duplicated text.
+        // model repeats either context halo or drifts from the target, retry the
+        // owned segment through the established standalone path.
         return try await polishChunk(
             transcript,
             modelContainer: modelContainer,
@@ -198,24 +261,23 @@ actor TranscriptPostProcessor {
     ) async throws -> String {
         try Task.checkCancellation()
 
-        let session = ChatSession(
-            modelContainer,
-            instructions: TranscriptPolishPolicy.instructions,
-            history: TranscriptPolishPolicy.fewShotHistory,
-            generateParameters: Self.generationParameters(transcript: chunk),
-            additionalContext: ["enable_thinking": TranscriptPolishPolicy.reasoningEnabled]
+        let stage: PostProcessingCallRecord.Stage = allowFallback ? .standalone : .fallbackChunk
+        let response = try await respond(
+            .polish,
+            to: TranscriptPolishPolicy.prompt(for: chunk),
+            source: chunk,
+            modelContainer: modelContainer
         )
-        let response = try await session.respond(
-            to: TranscriptPolishPolicy.prompt(for: chunk)
-        )
-        let candidate = TranscriptPolishPolicy.cleanModelOutput(response)
 
         if let candidate = TranscriptPolishPolicy.conservativeProjection(
-            of: candidate,
+            of: response.candidate,
             for: chunk
         ) {
-            if !allowFallback
-                || TranscriptPolishPolicy.containsImmediateRepeatedSpeech(candidate) {
+            record(response, stage: stage, outcome: .accepted, source: chunk)
+            // The recovery prompt exists for echoes the primary pass left
+            // behind. Running it unconditionally doubled the cost of every
+            // fallback chunk without changing fluent output.
+            if TranscriptPolishPolicy.containsImmediateRepeatedSpeech(candidate) {
                 return try await runDisfluencyRecovery(
                     candidate,
                     modelContainer: modelContainer
@@ -223,6 +285,7 @@ actor TranscriptPostProcessor {
             }
             return candidate
         }
+        record(response, stage: stage, outcome: .projectionRejected, source: chunk)
 
         guard allowFallback else {
             return try await runDisfluencyRecovery(
@@ -232,9 +295,9 @@ actor TranscriptPostProcessor {
         }
 
         // Qwen 0.6B can occasionally summarize a dense passage instead of
-        // editing it. Retry rejected output at sentence-sized boundaries, then
-        // apply a deletion-only recovery prompt guarded by a near-verbatim
-        // coverage check. This removes stutters without risking lost clauses.
+        // editing it. Retry rejected output one sentence at a time, then apply
+        // a deletion-only recovery prompt guarded by a near-verbatim coverage
+        // check. This removes stutters without risking lost clauses.
         let fallbackChunks = TranscriptPolishPolicy.fallbackChunks(from: chunk)
         guard fallbackChunks.count > 1 else {
             return try await runDisfluencyRecovery(
@@ -245,11 +308,18 @@ actor TranscriptPostProcessor {
 
         var polishedFallbackChunks: [String] = []
         for fallbackChunk in fallbackChunks {
+            let polished = try await polishChunk(
+                fallbackChunk,
+                modelContainer: modelContainer,
+                allowFallback: false
+            )
+            // A chunk that starts or ends mid-sentence must not gain a
+            // sentence boundary from the model; otherwise the joined text
+            // reads "a treatise. on the theory of ethics".
             polishedFallbackChunks.append(
-                try await polishChunk(
-                    fallbackChunk,
-                    modelContainer: modelContainer,
-                    allowFallback: false
+                TranscriptPolishPolicy.matchingSentenceBoundaries(
+                    of: polished,
+                    to: fallbackChunk
                 )
             )
         }
@@ -260,19 +330,174 @@ actor TranscriptPostProcessor {
         _ chunk: String,
         modelContainer: ModelContainer
     ) async throws -> String {
-        let session = ChatSession(
-            modelContainer,
-            instructions: TranscriptPolishPolicy.recoveryInstructions,
-            history: TranscriptPolishPolicy.recoveryHistory,
-            generateParameters: Self.generationParameters(transcript: chunk),
-            additionalContext: ["enable_thinking": false]
+        let response = try await respond(
+            .recovery,
+            to: chunk,
+            source: chunk,
+            modelContainer: modelContainer
         )
-        let response = try await session.respond(to: chunk)
-        let candidate = TranscriptPolishPolicy.cleanModelOutput(response)
 
-        return TranscriptPolishPolicy.isNearVerbatimRecovery(candidate, for: chunk)
-            ? candidate
-            : chunk
+        let candidate = TranscriptPolishPolicy.strippingEmphasisMarkup(
+            from: response.candidate,
+            absentFrom: chunk
+        )
+        if TranscriptPolishPolicy.isNearVerbatimRecovery(candidate, for: chunk) {
+            record(response, stage: .recovery, outcome: .accepted, source: chunk)
+            return candidate
+        }
+        record(response, stage: .recovery, outcome: .recoveryRejected, source: chunk)
+        return chunk
+    }
+
+    private func respond(
+        _ kind: PromptKind,
+        to prompt: String,
+        source: String,
+        modelContainer: ModelContainer
+    ) async throws -> ModelResponse {
+        try Task.checkCancellation()
+        let parameters = Self.generationParameters(transcript: source)
+        let promptCache = self.promptCache
+        let enableThinking: Bool
+        switch kind {
+        case .polish:
+            enableThinking = TranscriptPolishPolicy.reasoningEnabled
+        case .recovery:
+            enableThinking = false
+        }
+
+        let startedAt = ContinuousClock.now
+        let generation = try await modelContainer.perform { context in
+            var messages: [Chat.Message]
+            switch kind {
+            case .polish:
+                messages = [.system(TranscriptPolishPolicy.instructions)]
+                messages.append(contentsOf: TranscriptPolishPolicy.fewShotHistory)
+            case .recovery:
+                messages = [.system(TranscriptPolishPolicy.recoveryInstructions)]
+                messages.append(contentsOf: TranscriptPolishPolicy.recoveryHistory)
+            }
+            messages.append(.user(prompt))
+
+            let input = try await context.processor.prepare(
+                input: UserInput(
+                    chat: messages,
+                    additionalContext: ["enable_thinking": enableThinking]
+                )
+            )
+            return try await Self.generate(
+                promptTokens: input.text.tokens.asArray(Int.self),
+                parameters: parameters,
+                context: context,
+                promptCache: promptCache
+            )
+        }
+        let finishedAt = ContinuousClock.now
+
+        return ModelResponse(
+            candidate: TranscriptPolishPolicy.cleanModelOutput(generation.output),
+            rawOutput: generation.output,
+            promptTokenCount: generation.promptTokenCount,
+            reusedPromptTokenCount: generation.reusedPromptTokenCount,
+            generatedTokenCount: generation.generatedTokenCount,
+            promptSeconds: generation.promptSeconds,
+            generationSeconds: generation.generationSeconds,
+            startedAt: startedAt,
+            finishedAt: finishedAt
+        )
+    }
+
+    private struct GenerationOutput {
+        let output: String
+        let promptTokenCount: Int
+        let reusedPromptTokenCount: Int
+        let generatedTokenCount: Int
+        let promptSeconds: Double
+        let generationSeconds: Double
+    }
+
+    /// Generates a completion while reusing the key/value cache of the longest
+    /// prompt prefix shared with the previous call. Every polishing prompt
+    /// starts with the same instructions and few-shot examples, so only the
+    /// transcript-specific suffix is prefilled on each call.
+    private static func generate(
+        promptTokens: [Int],
+        parameters: GenerateParameters,
+        context: ModelContext,
+        promptCache: PromptPrefixCache
+    ) async throws -> GenerationOutput {
+        let promptStarted = ContinuousClock.now
+        let reused = promptCache.reuse(for: promptTokens)
+        let cache = reused?.cache ?? context.model.newCache(parameters: parameters)
+        let reusedTokenCount = reused?.reusedTokenCount ?? 0
+        let remainingTokens = Array(promptTokens[reusedTokenCount...])
+
+        let iterator = try TokenIterator(
+            input: LMInput(text: .init(tokens: MLXArray(remainingTokens))),
+            model: context.model,
+            cache: cache,
+            parameters: parameters
+        )
+        let promptSeconds = Self.seconds(promptStarted.duration(to: .now))
+
+        let generationStarted = ContinuousClock.now
+        let (stream, task) = MLXLMCommon.generateTask(
+            promptTokenCount: remainingTokens.count,
+            modelConfiguration: context.configuration,
+            tokenizer: context.tokenizer,
+            iterator: iterator
+        )
+        var output = ""
+        var generatedTokenCount = 0
+        for await item in stream {
+            switch item {
+            case let .chunk(chunk):
+                output += chunk
+            case let .info(info):
+                generatedTokenCount = info.generationTokenCount
+            case .toolCall:
+                break
+            }
+        }
+        await task.value
+        let generationSeconds = Self.seconds(generationStarted.duration(to: .now))
+
+        promptCache.store(cache, promptTokens: promptTokens)
+        return GenerationOutput(
+            output: output,
+            promptTokenCount: promptTokens.count,
+            reusedPromptTokenCount: reusedTokenCount,
+            generatedTokenCount: generatedTokenCount,
+            promptSeconds: promptSeconds,
+            generationSeconds: generationSeconds
+        )
+    }
+
+    private func record(
+        _ response: ModelResponse,
+        stage: PostProcessingCallRecord.Stage,
+        outcome: PostProcessingCallRecord.Outcome,
+        source: String
+    ) {
+        callRecords.append(
+            PostProcessingCallRecord(
+                stage: stage,
+                outcome: outcome,
+                sourceWordCount: source.split(whereSeparator: \.isWhitespace).count,
+                promptTokenCount: response.promptTokenCount,
+                reusedPromptTokenCount: response.reusedPromptTokenCount,
+                generatedTokenCount: response.generatedTokenCount,
+                promptSeconds: response.promptSeconds,
+                generationSeconds: response.generationSeconds,
+                startedAt: response.startedAt,
+                finishedAt: response.finishedAt,
+                source: source,
+                output: response.candidate
+            )
+        )
+        if callRecords.count > 512 {
+            callRecords.removeFirst(callRecords.count - 512)
+        }
     }
 
     func cancelPreparationAndUnload() {
@@ -282,6 +507,7 @@ actor TranscriptPostProcessor {
         loadingOperationID = nil
         modelContainer = nil
         loadedModel = nil
+        promptCache.clear()
     }
 
     private func finishLoading(
@@ -337,12 +563,19 @@ actor TranscriptPostProcessor {
     private nonisolated static func generationParameters(
         transcript: String
     ) -> GenerateParameters {
+        // No repetition penalty: the task is verbatim copying, and a penalty
+        // discourages re-emitting exactly the repeated source words that a
+        // faithful edit must keep ("content here, content here").
         return GenerateParameters(
             maxTokens: TranscriptPolishPolicy.maximumOutputTokens(for: transcript),
             temperature: 0,
-            topP: 1,
-            repetitionPenalty: 1.03
+            topP: 1
         )
+    }
+
+    private nonisolated static func seconds(_ duration: Duration) -> Double {
+        let components = duration.components
+        return Double(components.seconds) + Double(components.attoseconds) / 1e18
     }
 
     private nonisolated static func isNonemptyFile(at url: URL) -> Bool {
@@ -371,6 +604,61 @@ actor TranscriptPostProcessor {
 }
 
 extension TranscriptPostProcessor: TranscriptPolishing {}
+
+/// Keeps the key/value cache of the most recent prompt so the next prompt can
+/// skip prefilling the tokens it shares with it. Only ever touched inside
+/// `ModelContainer.perform`, which serializes model access.
+private final class PromptPrefixCache: @unchecked Sendable {
+    private var cache: [KVCache] = []
+    private var tokens: [Int] = []
+    private let minimumReusableTokens = 16
+
+    func reuse(for promptTokens: [Int]) -> (cache: [KVCache], reusedTokenCount: Int)? {
+        guard !cache.isEmpty,
+              cache.allSatisfy(\.isTrimmable),
+              promptTokens.count > 1 else { return nil }
+
+        // Leave at least one prompt token to process so the model produces
+        // logits for the first generated token.
+        let limit = min(tokens.count, promptTokens.count - 1)
+        var shared = 0
+        while shared < limit, tokens[shared] == promptTokens[shared] {
+            shared += 1
+        }
+        guard shared >= minimumReusableTokens else { return nil }
+
+        for layer in cache {
+            let excess = layer.offset - shared
+            guard excess >= 0 else {
+                clear()
+                return nil
+            }
+            if excess > 0 { layer.trim(excess) }
+        }
+        tokens = Array(tokens.prefix(shared))
+        return (cache, shared)
+    }
+
+    func store(_ cache: [KVCache], promptTokens: [Int]) {
+        // Generation appended the response tokens; keep only the prompt so a
+        // later prompt can extend the shared prefix.
+        for layer in cache {
+            let excess = layer.offset - promptTokens.count
+            guard layer.isTrimmable, excess >= 0 else {
+                clear()
+                return
+            }
+            if excess > 0 { layer.trim(excess) }
+        }
+        self.cache = cache
+        tokens = promptTokens
+    }
+
+    func clear() {
+        cache = []
+        tokens = []
+    }
+}
 
 enum TranscriptPolishPolicy {
     static let reasoningEnabled = false
@@ -530,11 +818,62 @@ enum TranscriptPolishPolicy {
         chunks(from: transcript, maximumCharacters: maximumChunkCharacters)
     }
 
+    /// Retries a rejected passage one sentence at a time. Only a sentence that
+    /// is itself longer than the fallback window is split further, at clause
+    /// boundaries where possible, so chunk seams rarely fall mid-sentence.
     static func fallbackChunks(from transcript: String) -> [String] {
-        chunks(from: transcript, maximumCharacters: fallbackChunkCharacters)
+        let sentences = StreamingTranscriptPolicy.sentenceSegments(in: transcript)
+        guard sentences.count > 1 else {
+            return chunks(from: transcript, maximumCharacters: fallbackChunkCharacters)
+        }
+        return sentences.flatMap { sentence in
+            chunks(from: sentence, maximumCharacters: fallbackChunkCharacters)
+        }
     }
 
-    private static func chunks(
+    /// Removes a sentence boundary the model added at the seam of a chunk that
+    /// does not start or end a sentence in the source, and restores the
+    /// source's lowercase start when the chunk began mid-sentence.
+    static func matchingSentenceBoundaries(
+        of polished: String,
+        to source: String
+    ) -> String {
+        var result = polished.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !result.isEmpty else { return result }
+
+        if !StreamingTranscriptPolicy.endsAtStrongBoundary(source) {
+            var characters = Array(result)
+            var closers: [Character] = []
+            while let last = characters.last,
+                  StreamingTranscriptPolicy.isClosingCharacter(last) {
+                closers.insert(last, at: 0)
+                characters.removeLast()
+            }
+            var removed = false
+            while let last = characters.last,
+                  StreamingTranscriptPolicy.isStrongTerminator(last) {
+                characters.removeLast()
+                removed = true
+            }
+            if removed {
+                result = String(characters + closers)
+            }
+        }
+
+        if let sourceFirst = source.first(where: { $0.isLetter || $0.isNumber }),
+           sourceFirst.isLowercase,
+           let resultIndex = result.firstIndex(where: { $0.isLetter || $0.isNumber }),
+           result[resultIndex].isUppercase,
+           result[resultIndex].lowercased() == String(sourceFirst) {
+            result.replaceSubrange(
+                resultIndex...resultIndex,
+                with: result[resultIndex].lowercased()
+            )
+        }
+        return result
+    }
+
+    static func chunks(
         from transcript: String,
         maximumCharacters: Int
     ) -> [String] {
@@ -590,9 +929,15 @@ enum TranscriptPolishPolicy {
         ) {
             return sentence
         }
-        return lastPunctuationBoundary(
+        if let clause = lastPunctuationBoundary(
             in: characters,
             terminators: [";", ":", "；", "："]
+        ) {
+            return clause
+        }
+        return lastPunctuationBoundary(
+            in: characters,
+            terminators: [",", "，", "、"]
         )
     }
 
@@ -740,34 +1085,21 @@ enum TranscriptPolishPolicy {
     static func isNearVerbatimRecovery(_ candidate: String, for source: String) -> Bool {
         guard isAcceptable(candidate, for: source) else { return false }
 
-        let sourceWords = words(in: source)
-        let candidateWords = words(in: candidate)
-        let orderedOverlap = orderedWordOverlapLength(sourceWords, candidateWords)
-
         // Recovery is allowed to delete model-identified repetitions, but it
         // must never substitute or invent lexical content. Case and punctuation
-        // are ignored by words(in:), so those remain safe to improve.
-        guard orderedOverlap == candidateWords.count else { return false }
+        // are ignored by the word tokens, so those remain safe to improve.
         guard let deletedSourceIndices = orderedSubsetDeletionIndices(
-                  source: sourceWords,
-                  candidate: candidateWords
-              ),
-              deletionsRespectImmediateRepeatedSpeech(
-                  deletedSourceIndices,
-                  in: sourceWords
-              ) else {
+            of: candidate,
+            from: source
+        ) else {
             return false
         }
-
-        let repeatedSpeechAllowance = repeatedSpeechWordCount(in: sourceWords)
-        let smallDisfluencyAllowance = repeatedSpeechAllowance > 0
-            ? max(2, sourceWords.count / 20)
-            : 0
-
-        return candidateWords.count
-            + repeatedSpeechAllowance
-            + smallDisfluencyAllowance
-            >= sourceWords.count
+        return deletionsAreWithinBudget(
+            deletedSourceIndices,
+            in: wordTokens(in: source),
+            source: source,
+            budget: .recovery
+        )
     }
 
     static func containsImmediateRepeatedSpeech(_ text: String) -> Bool {
@@ -783,35 +1115,22 @@ enum TranscriptPolishPolicy {
             return false
         }
 
-        let sourceWords = words(in: source)
-        let candidateWords = words(in: candidate)
-        guard !sourceWords.isEmpty, !candidateWords.isEmpty else { return false }
-
         // The editor may remove disfluencies, but all words it keeps must come
         // from the source in the original order. This turns prompt guidance
         // into a hard safety property and prevents a small model from guessing
         // names, "correcting" recognition errors, or paraphrasing a clause.
-        let orderedOverlap = orderedWordOverlapLength(sourceWords, candidateWords)
-        guard orderedOverlap == candidateWords.count else { return false }
         guard let deletedSourceIndices = orderedSubsetDeletionIndices(
-                  source: sourceWords,
-                  candidate: candidateWords
-              ),
-              deletionsRespectImmediateRepeatedSpeech(
-                  deletedSourceIndices,
-                  in: sourceWords
-              ) else {
+            of: candidate,
+            from: source
+        ) else {
             return false
         }
-
-        let repeatedSpeechAllowance = repeatedSpeechWordCount(in: sourceWords)
-        let otherDisfluencyAllowance = repeatedSpeechAllowance > 0
-            ? max(4, sourceWords.count / 16)
-            : 0
-        return candidateWords.count
-            + repeatedSpeechAllowance
-            + otherDisfluencyAllowance
-            >= sourceWords.count
+        return deletionsAreWithinBudget(
+            deletedSourceIndices,
+            in: wordTokens(in: source),
+            source: source,
+            budget: .conservative
+        )
     }
 
     /// Preserves Qwen's punctuation and model-selected disfluency deletions,
@@ -822,6 +1141,7 @@ enum TranscriptPolishPolicy {
         of candidate: String,
         for source: String
     ) -> String? {
+        let candidate = strippingEmphasisMarkup(from: candidate, absentFrom: source)
         guard passesBasicSafety(candidate, for: source),
               !introducesPresentationMarkup(candidate, absentFrom: source) else {
             return nil
@@ -854,7 +1174,6 @@ enum TranscriptPolishPolicy {
         }
         if !currentRun.isEmpty { editRuns.append(currentRun) }
 
-        var retainedSourceDeletions = 0
         var modelDeletedSourceIndices = Set<Int>()
         var edits: [(range: Range<String.Index>, replacement: String)] = []
         for run in editRuns {
@@ -879,7 +1198,6 @@ enum TranscriptPolishPolicy {
             }
 
             guard containsNovelCandidateWords else {
-                retainedSourceDeletions += sourceIndices.count
                 modelDeletedSourceIndices.formUnion(sourceIndices)
                 continue
             }
@@ -906,25 +1224,17 @@ enum TranscriptPolishPolicy {
             )
         }
 
-        let repeatedSpeechAllowance = repeatedSpeechWordCount(
-            in: sourceTokens.map(\.normalized)
-        )
-        guard deletionsRespectImmediateRepeatedSpeech(
-            modelDeletedSourceIndices,
-            in: sourceTokens.map(\.normalized)
-        ) else {
-            return nil
-        }
-        // A fluent source with no immediate repeated span gets no lexical
-        // deletion budget. If repeated speech is present, Qwen still decides
-        // whether it is accidental and may also remove a nearby false start.
+        // A fluent source with no immediate repeated span or partial-word
+        // retry gets no lexical deletion budget. Qwen still decides whether a
+        // repetition is accidental and may also remove a nearby false start.
         // This remains language-agnostic and prevents optional fluent words
         // from being silently treated as repairs.
-        let otherDisfluencyAllowance = repeatedSpeechAllowance > 0
-            ? max(4, sourceTokens.count / 16)
-            : 0
-        guard retainedSourceDeletions
-                <= repeatedSpeechAllowance + otherDisfluencyAllowance else {
+        guard deletionsAreWithinBudget(
+                  modelDeletedSourceIndices,
+                  in: sourceTokens,
+                  source: source,
+                  budget: .conservative
+              ) else {
             return nil
         }
 
@@ -932,7 +1242,9 @@ enum TranscriptPolishPolicy {
         for edit in edits.sorted(by: { $0.range.lowerBound > $1.range.lowerBound }) {
             projected.replaceSubrange(edit.range, with: edit.replacement)
         }
-        projected = TranscriptCleaner.clean(projected)
+        projected = TranscriptCleaner.clean(
+            removingInsertedSentenceBreaks(from: projected, for: source)
+        )
 
         guard isConservativeEditAcceptable(projected, for: source) else {
             return nil
@@ -1021,6 +1333,81 @@ enum TranscriptPolishPolicy {
             return false
         }
         return true
+    }
+
+    /// Small models like to wrap foreign or unfamiliar terms in Markdown
+    /// emphasis. Because the safety projection compares words only, stripping
+    /// the markers is safe when the source contains none of them, and avoids a
+    /// retry that would otherwise reject an otherwise correct edit.
+    static func strippingEmphasisMarkup(
+        from candidate: String,
+        absentFrom source: String
+    ) -> String {
+        var result = candidate
+        if !source.contains("*"), result.contains("*") {
+            result = result.replacingOccurrences(of: "*", with: "")
+        }
+        if !source.contains("_"), result.contains("_") {
+            result = result.replacingOccurrences(
+                of: #"(?<![\p{L}\p{N}])_([^_\n]+)_(?![\p{L}\p{N}])"#,
+                with: "$1",
+                options: .regularExpression
+            )
+        }
+        return result
+    }
+
+    /// Removes a sentence terminator the model placed after a word that does
+    /// not end a sentence in the source when the following word is lowercase.
+    /// A 0.6B model sometimes replaces a deleted echo with a period, producing
+    /// "dummy text. of the printing" from "dummy text text of the printing".
+    static func removingInsertedSentenceBreaks(
+        from candidate: String,
+        for source: String
+    ) -> String {
+        let sourceTokens = wordTokens(in: source)
+        let candidateTokens = wordTokens(in: candidate)
+        guard !sourceTokens.isEmpty, !candidateTokens.isEmpty else { return candidate }
+
+        var matchedSourceIndex: [Int: Int] = [:]
+        for step in wordAlignment(
+            source: sourceTokens.map(\.normalized),
+            candidate: candidateTokens.map(\.normalized)
+        ) {
+            if case let .match(sourceIndex, candidateIndex) = step {
+                matchedSourceIndex[candidateIndex] = sourceIndex
+            }
+        }
+
+        var removals: [String.Index] = []
+        for (candidateIndex, token) in candidateTokens.enumerated() {
+            let terminatorIndex = token.range.upperBound
+            guard terminatorIndex < candidate.endIndex,
+                  StreamingTranscriptPolicy.isStrongTerminator(candidate[terminatorIndex]) else {
+                continue
+            }
+            var cursor = candidate.index(after: terminatorIndex)
+            guard cursor < candidate.endIndex, candidate[cursor].isWhitespace else { continue }
+            while cursor < candidate.endIndex, candidate[cursor].isWhitespace {
+                cursor = candidate.index(after: cursor)
+            }
+            guard cursor < candidate.endIndex, candidate[cursor].isLowercase else { continue }
+
+            if let sourceIndex = matchedSourceIndex[candidateIndex],
+               StreamingTranscriptPolicy.hasStrongBoundary(
+                   after: sourceTokens[sourceIndex].range.upperBound,
+                   in: source
+               ) {
+                continue
+            }
+            removals.append(terminatorIndex)
+        }
+
+        var result = candidate
+        for index in removals.reversed() {
+            result.remove(at: index)
+        }
+        return result
     }
 
     private static func introducesPresentationMarkup(
@@ -1178,12 +1565,19 @@ enum TranscriptPolishPolicy {
         return previous[candidate.count]
     }
 
+    /// Returns the source word indices a candidate omits when every candidate
+    /// word comes from the source in order, or nil when the candidate
+    /// substitutes or invents a word.
     private static func orderedSubsetDeletionIndices(
-        source: [String],
-        candidate: [String]
+        of candidate: String,
+        from source: String
     ) -> Set<Int>? {
+        let sourceWords = words(in: source)
+        let candidateWords = words(in: candidate)
+        guard !sourceWords.isEmpty, !candidateWords.isEmpty else { return nil }
+
         var deletions = Set<Int>()
-        for step in wordAlignment(source: source, candidate: candidate) {
+        for step in wordAlignment(source: sourceWords, candidate: candidateWords) {
             switch step {
             case .match:
                 break
@@ -1194,6 +1588,89 @@ enum TranscriptPolishPolicy {
             }
         }
         return deletions
+    }
+
+    private enum DeletionBudget {
+        case conservative
+        case recovery
+    }
+
+    /// Lexical deletions are allowed only for visible speech mistakes: complete
+    /// copies of immediately repeated speech, partial-word retries, and, once
+    /// repeated speech proves the passage is disfluent, a small number of
+    /// nearby false starts the model identified.
+    private static func deletionsAreWithinBudget(
+        _ deletedIndices: Set<Int>,
+        in tokens: [WordToken],
+        source: String,
+        budget: DeletionBudget
+    ) -> Bool {
+        let words = tokens.map(\.normalized)
+        guard deletionsRespectImmediateRepeatedSpeech(deletedIndices, in: words) else {
+            return false
+        }
+
+        let repeatedSpeechAllowance = repeatedSpeechWordCount(in: words)
+        let partialWordRetryAllowance = partialWordRetryDeletionCount(
+            deletedIndices,
+            in: tokens,
+            source: source
+        )
+        let otherDisfluencyAllowance: Int
+        switch budget {
+        case .conservative:
+            otherDisfluencyAllowance = repeatedSpeechAllowance > 0
+                ? max(4, words.count / 16)
+                : 0
+        case .recovery:
+            otherDisfluencyAllowance = repeatedSpeechAllowance > 0
+                ? max(2, words.count / 20)
+                : 0
+        }
+        return deletedIndices.count
+            <= repeatedSpeechAllowance
+            + partialWordRetryAllowance
+            + otherDisfluencyAllowance
+    }
+
+    /// Counts deleted words that are a strict prefix of the next retained word,
+    /// such as "s simply" or "typ typesetting": a speaker restarting a word.
+    /// Tokens attached to the preceding word by an apostrophe or hyphen
+    /// ("industry's standard", "re-read") are never treated as retries.
+    private static func partialWordRetryDeletionCount(
+        _ deletedIndices: Set<Int>,
+        in tokens: [WordToken],
+        source: String
+    ) -> Int {
+        var count = 0
+        for index in deletedIndices.sorted() where index < tokens.count {
+            guard !isAttachedToPrecedingWord(tokens[index], in: source) else { continue }
+
+            var nextIndex = index + 1
+            while nextIndex < tokens.count, deletedIndices.contains(nextIndex) {
+                nextIndex += 1
+            }
+            guard nextIndex < tokens.count,
+                  !isAttachedToPrecedingWord(tokens[nextIndex], in: source) else {
+                continue
+            }
+
+            let fragment = tokens[index].normalized
+            let completed = tokens[nextIndex].normalized
+            if completed.count > fragment.count, completed.hasPrefix(fragment) {
+                count += 1
+            }
+        }
+        return count
+    }
+
+    private static func isAttachedToPrecedingWord(
+        _ token: WordToken,
+        in source: String
+    ) -> Bool {
+        guard token.range.lowerBound > source.startIndex else { return false }
+        let joiners: Set<Character> = ["'", "’", "-", "‐", "‑", "–"]
+        return joiners.contains(source[source.index(before: token.range.lowerBound)])
     }
 
     /// A model may remove a complete copy of an adjacent repeated phrase, but

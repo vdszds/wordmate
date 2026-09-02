@@ -75,7 +75,8 @@ final class ParakeetEngine {
 
     func transcribeStreaming(
         _ audioChunks: AsyncStream<LiveAudioChunk>,
-        onStableSegment: @escaping @Sendable (String) async -> Void
+        onStableSegment: @escaping @Sendable (StreamingStableRange) async -> Void,
+        onCheckpoint: (@Sendable (StreamingCheckpointEvent) -> Void)? = nil
     ) async throws -> String {
         try await prepare()
         guard let manager else {
@@ -86,77 +87,136 @@ final class ParakeetEngine {
 
         // Parakeet TDT v3 is an offline model. Sliding fixed windows introduced
         // word seams (for example, "four" + "teen") and materially reduced
-        // accuracy. Instead, transcribe the cumulative audio every ten seconds.
+        // accuracy. Instead, transcribe the cumulative audio at checkpoints.
         // Completed sentences from those snapshots are stable enough for Qwen
         // to polish while recording, while the final pass remains bit-for-bit
         // equivalent to the established whole-recording ASR path.
-        let checkpointInterval: TimeInterval = 10
+        //
+        // Polishing runs on its own queue, so the only cost carried by this
+        // loop is the cumulative Parakeet pass itself. The checkpoint gap grows
+        // with that pass so long recordings never spend most of their time
+        // re-transcribing audio.
+        let checkpointInterval: TimeInterval = Self.checkpointInterval
         var nextCheckpoint = checkpointInterval
         var accumulator = LiveAudioAccumulator()
-        var emittedSource = ""
-        var previousProvisional = ""
-        var canEmitStablePrefixes = true
+        var tracker = StreamingEmissionTracker()
+        var committedText = ""
+        let clock = ContinuousClock()
 
         for await chunk in audioChunks {
             try Task.checkCancellation()
             try accumulator.append(chunk)
 
             guard accumulator.duration >= nextCheckpoint else { continue }
-            while nextCheckpoint <= accumulator.duration {
-                nextCheckpoint += checkpointInterval
-            }
 
             let snapshot = try accumulator.mono16kSamples()
+            let started = clock.now
             let provisional = TranscriptCleaner.clean(
                 try await transcribe(snapshot, with: manager)
             )
-            let conservativePrefix = StreamingTranscriptPolicy.stablePrefix(
-                of: provisional
+            let finished = clock.now
+            let elapsedSeconds = Self.seconds(started.duration(to: finished))
+            onCheckpoint?(
+                StreamingCheckpointEvent(
+                    kind: .checkpoint,
+                    audioSeconds: accumulator.duration,
+                    transcriptionSeconds: elapsedSeconds,
+                    startedAt: started,
+                    finishedAt: finished
+                )
             )
-            let confirmedPrefix = StreamingTranscriptReconciler.confirmedPrefix(
-                in: provisional,
-                against: previousProvisional,
-                holdingBack: 8
+            nextCheckpoint = accumulator.duration
+                + max(checkpointInterval, elapsedSeconds * Self.minimumCheckpointGapFactor)
+
+            let stableText = StreamingTranscriptPolicy.committedSentencePrefix(
+                of: provisional,
+                minimumTrailingWords: Self.minimumTrailingWords
             )
-            let confirmedSentencePrefix = StreamingTranscriptPolicy
-                .completeSentencePrefix(of: confirmedPrefix)
-            previousProvisional = provisional
-
-            guard canEmitStablePrefixes else { continue }
-            let candidates = [conservativePrefix, confirmedSentencePrefix]
-                .filter { !$0.isEmpty }
-                .sorted {
-                    StreamingTranscriptReconciler.wordCount(in: $0)
-                        > StreamingTranscriptReconciler.wordCount(in: $1)
-                }
-            guard !candidates.isEmpty else { continue }
-
-            var stablePrefix: String?
-            var newSource: String?
-            for candidate in candidates {
-                guard let suffix = StreamingTranscriptReconciler.unprocessedSuffix(
-                    in: candidate,
-                    afterProcessedPrefix: emittedSource
-                ) else { continue }
-                stablePrefix = candidate
-                newSource = suffix
-                break
+            for range in tracker.newRanges(in: stableText) {
+                await onStableSegment(range)
             }
-
-            guard let stablePrefix, let newSource else {
-                // A cumulative revision changed already-emitted words. Stop
-                // speculating; final anchoring will reprocess only unsafe spans.
-                canEmitStablePrefixes = false
-                continue
+            if !stableText.isEmpty {
+                committedText = stableText
             }
-
-            guard !newSource.isEmpty else { continue }
-            await onStableSegment(newSource)
-            emittedSource = stablePrefix
         }
 
         try Task.checkCancellation()
         let finalSamples = try accumulator.mono16kSamples()
-        return try await transcribe(finalSamples, with: manager)
+
+        // Speculative tail: a short pass over the last seconds of audio finds
+        // the text after the last committed sentence, so Qwen can polish it
+        // while the authoritative pass runs. The final reconciliation reuses
+        // that work only if the whole-recording transcript matches it word
+        // for word; otherwise the tail is simply polished again.
+        let tailSampleCount = Int(Self.speculativeTailSeconds * AudioSampleLoader.sampleRate)
+        if !committedText.isEmpty,
+           finalSamples.count > tailSampleCount + Int(AudioSampleLoader.sampleRate) {
+            let tailSamples = Array(finalSamples.suffix(tailSampleCount))
+            let tailStarted = clock.now
+            let tailTranscript = TranscriptCleaner.clean(
+                try await transcribe(tailSamples, with: manager)
+            )
+            let tailFinished = clock.now
+            onCheckpoint?(
+                StreamingCheckpointEvent(
+                    kind: .speculativeTail,
+                    audioSeconds: Double(tailSamples.count) / AudioSampleLoader.sampleRate,
+                    transcriptionSeconds: Self.seconds(tailStarted.duration(to: tailFinished)),
+                    startedAt: tailStarted,
+                    finishedAt: tailFinished
+                )
+            )
+            if let tail = StreamingTranscriptReconciler.textFollowing(
+                committedText: committedText,
+                in: tailTranscript
+            ) {
+                await onStableSegment(
+                    StreamingStableRange(
+                        source: tail,
+                        precedingContext: StreamingTranscriptPolicy.trailingContext(
+                            of: committedText
+                        ),
+                        followingContext: "",
+                        isTerminal: true
+                    )
+                )
+            }
+        }
+
+        let finalStarted = clock.now
+        let finalTranscript = try await transcribe(finalSamples, with: manager)
+        let finalFinished = clock.now
+        onCheckpoint?(
+            StreamingCheckpointEvent(
+                kind: .finalPass,
+                audioSeconds: accumulator.duration,
+                transcriptionSeconds: Self.seconds(finalStarted.duration(to: finalFinished)),
+                startedAt: finalStarted,
+                finishedAt: finalFinished
+            )
+        )
+        return finalTranscript
     }
+
+    /// Audio window transcribed at release to locate the uncommitted tail.
+    /// It must reach back past the end of the last committed sentence, so it
+    /// covers the checkpoint interval plus a long sentence in progress.
+    static let speculativeTailSeconds: TimeInterval = 12
+
+    private static func seconds(_ duration: Duration) -> Double {
+        Double(duration.components.seconds)
+            + Double(duration.components.attoseconds) / 1e18
+    }
+
+    /// Seconds of new audio between cumulative checkpoints.
+    static let checkpointInterval: TimeInterval = 5
+
+    /// A checkpoint waits at least this many times the previous checkpoint's
+    /// own transcription time, bounding the share of time spent in Parakeet.
+    static let minimumCheckpointGapFactor = 3.0
+
+    /// A sentence is committed only when this many further words follow its
+    /// boundary in the same snapshot, so a period Parakeet adds at a mid-word
+    /// cut is never mistaken for a real sentence end.
+    static let minimumTrailingWords = 3
 }

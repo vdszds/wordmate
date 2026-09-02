@@ -51,22 +51,87 @@ struct LiveDictationResult: Sendable {
     }
 }
 
+/// Text that cumulative ASR has committed while recording, together with the
+/// neighbouring transcript that Qwen may read but must never return.
+struct StreamingStableRange: Sendable, Equatable {
+    let source: String
+    let precedingContext: String
+    let followingContext: String
+
+    /// True when no further text can follow this range (the speculative tail
+    /// emitted at release), so short or unfinished sentences are polished at
+    /// once instead of waiting for later context.
+    let isTerminal: Bool
+
+    init(
+        source: String,
+        precedingContext: String,
+        followingContext: String,
+        isTerminal: Bool = false
+    ) {
+        self.source = source
+        self.precedingContext = precedingContext
+        self.followingContext = followingContext
+        self.isTerminal = isTerminal
+    }
+}
+
+/// One Parakeet pass made by the streaming loop.
+struct StreamingCheckpointEvent: Sendable {
+    enum Kind: String, Sendable {
+        /// Cumulative transcription while recording.
+        case checkpoint
+        /// Short pass over the last seconds of audio at release, used to
+        /// start polishing the tail while the final pass runs.
+        case speculativeTail
+        /// Authoritative whole-recording pass after release.
+        case finalPass
+    }
+
+    let kind: Kind
+    let audioSeconds: Double
+    let transcriptionSeconds: Double
+    let startedAt: ContinuousClock.Instant
+    let finishedAt: ContinuousClock.Instant
+}
+
 /// Polishes stable Parakeet segments while recording. Every polished segment
 /// owns a disjoint source span; adjacent spans are supplied to Qwen only as
 /// read-only context, so overlap can never duplicate pasted text.
+///
+/// Segments are queued and polished by a single background worker so the
+/// audio loop never waits for the language model. At release, only the
+/// in-flight call is awaited; queued segments that never started are folded
+/// into the final reconciliation, where adjacent ones merge into one call.
 actor StreamingTranscriptPolisher {
     private struct Segment: Sendable {
         let source: String
         let polished: String
     }
 
+    private struct QueuedSegment: Sendable {
+        let source: String
+        let precedingContext: String
+        let followingContext: String
+    }
+
+    private static let finalRangeChunkCharacters = 600
+
+    /// Fragments shorter than this, such as the "Bridge Brid St." left behind
+    /// by an abbreviation period, are polished together with the sentence
+    /// that follows them instead of on their own.
+    private static let minimumSegmentWords = 4
+
     private let isEnabled: Bool
     private let model: PostProcessingModel
     private let processor: any TranscriptPolishing
 
     private var polishedSegments: [Segment] = []
-    private var pendingSegment: String?
-    private var previousSourceContext = ""
+    private var queue: [QueuedSegment] = []
+    private var pendingSegment: QueuedSegment?
+    private var lastQueuedSource = ""
+    private var worker: Task<Void, Never>?
+    private var isFinalizing = false
     private var encounteredFailure = false
 
     init(
@@ -79,50 +144,99 @@ actor StreamingTranscriptPolisher {
         self.processor = processor
     }
 
-    func consumeStableSegment(_ rawSegment: String) async {
-        guard isEnabled, !encounteredFailure else { return }
-        let segment = TranscriptCleaner.clean(rawSegment)
+    /// Accepts contiguous stable text. Context halos are derived from the
+    /// previously queued segment and from the sentences within this call.
+    func consumeStableSegment(_ rawSegment: String) {
+        consumeStableSegment(
+            StreamingStableRange(
+                source: rawSegment,
+                precedingContext: StreamingTranscriptPolicy.trailingContext(
+                    of: lastQueuedSource
+                ),
+                followingContext: ""
+            )
+        )
+    }
+
+    /// Queues every complete sentence in the range for polishing and returns
+    /// immediately. The range's context halos are used only where this call
+    /// has no neighbouring sentence of its own.
+    func consumeStableSegment(_ range: StreamingStableRange) {
+        guard isEnabled, !encounteredFailure, !isFinalizing else { return }
+        let segment = TranscriptCleaner.clean(range.source)
         guard !segment.isEmpty else { return }
 
         // Own each complete sentence independently. A final ASR revision can
         // then invalidate only that sentence instead of throwing away an entire
         // multi-sentence checkpoint that Qwen already polished.
-        let sentenceSegments = StreamingTranscriptPolicy.sentenceSegments(
-            in: segment
+        var sentences = StreamingTranscriptPolicy.sentenceSegments(
+            in: segment,
+            mergingSegmentsShorterThan: Self.minimumSegmentWords
         )
-        for (index, currentSegment) in sentenceSegments.enumerated() {
-            let followingSegment = index + 1 < sentenceSegments.count
-                ? sentenceSegments[index + 1]
-                : ""
+        var precedingContext = StreamingTranscriptPolicy.trailingContext(
+            of: range.precedingContext
+        )
 
-            // An unfinished segment waits for the next Parakeet window. That
-            // next window becomes a right-side context halo, while output
-            // ownership stays exclusively with the pending segment.
-            if let pendingSegment {
-                await process(
-                    pendingSegment,
-                    followingContext: StreamingTranscriptPolicy.leadingContext(
-                        of: currentSegment
-                    )
-                )
-                self.pendingSegment = nil
-            }
-
-            guard !encounteredFailure else { return }
-            if StreamingTranscriptPolicy.endsAtStrongBoundary(currentSegment) {
-                await process(
-                    currentSegment,
-                    followingContext: StreamingTranscriptPolicy.leadingContext(
-                        of: followingSegment
-                    )
-                )
+        if let pending = pendingSegment, let first = sentences.first {
+            pendingSegment = nil
+            precedingContext = pending.precedingContext
+            if StreamingTranscriptReconciler.wordCount(in: pending.source)
+                < Self.minimumSegmentWords {
+                // A short fragment joins the sentence that follows it.
+                sentences[0] = pending.source + " " + first
             } else {
-                pendingSegment = currentSegment
+                // An unfinished segment waited for the next stable text. That
+                // text becomes a right-side context halo, while output
+                // ownership stays exclusively with the pending segment.
+                enqueue(
+                    QueuedSegment(
+                        source: pending.source,
+                        precedingContext: pending.precedingContext,
+                        followingContext: StreamingTranscriptPolicy.leadingContext(
+                            of: first
+                        )
+                    )
+                )
+                precedingContext = StreamingTranscriptPolicy.trailingContext(
+                    of: pending.source
+                )
             }
+        }
+
+        for (index, sentence) in sentences.enumerated() {
+            let isLast = index + 1 == sentences.count
+            let followingContext = isLast
+                ? StreamingTranscriptPolicy.leadingContext(of: range.followingContext)
+                : StreamingTranscriptPolicy.leadingContext(of: sentences[index + 1])
+            let queued = QueuedSegment(
+                source: sentence,
+                precedingContext: precedingContext,
+                followingContext: followingContext
+            )
+            let isShort = StreamingTranscriptReconciler.wordCount(in: sentence)
+                < Self.minimumSegmentWords
+            if range.isTerminal {
+                enqueue(queued)
+            } else if isLast, isShort {
+                pendingSegment = queued
+            } else if StreamingTranscriptPolicy.endsAtStrongBoundary(sentence)
+                || !followingContext.isEmpty {
+                enqueue(queued)
+            } else {
+                pendingSegment = queued
+            }
+            precedingContext = StreamingTranscriptPolicy.trailingContext(of: sentence)
         }
     }
 
     func finalize(rawTranscript: String) async -> LiveDictationResult {
+        isFinalizing = true
+        // Segments that never started are cheaper to polish as merged final
+        // ranges than as individual queued calls, so drop them here.
+        queue.removeAll()
+        pendingSegment = nil
+        await worker?.value
+
         let rawTranscript = TranscriptCleaner.clean(rawTranscript)
         guard isEnabled, !rawTranscript.isEmpty else {
             return LiveDictationResult(
@@ -220,20 +334,96 @@ actor StreamingTranscriptPolisher {
         )
     }
 
+    /// Stops polishing a discarded recording. Queued segments are dropped and
+    /// no further segments are accepted; an in-flight call finishes on its own.
+    func cancel() {
+        isFinalizing = true
+        queue.removeAll()
+        pendingSegment = nil
+    }
+
+    /// Waits until every queued segment has been polished. Used by tests;
+    /// production code never blocks the audio loop on the language model.
+    func waitForQueuedWork() async {
+        while let worker {
+            await worker.value
+            if self.worker == nil { return }
+        }
+    }
+
+    private func enqueue(_ segment: QueuedSegment) {
+        queue.append(segment)
+        lastQueuedSource = segment.source
+        guard worker == nil else { return }
+        worker = Task { await self.drainQueue() }
+    }
+
+    private func drainQueue() async {
+        while !isFinalizing, !encounteredFailure, !queue.isEmpty {
+            let segment = queue.removeFirst()
+            await process(segment)
+        }
+        worker = nil
+    }
+
+    private func process(_ segment: QueuedSegment) async {
+        do {
+            let polished = try await processor.polishStreamingSegment(
+                segment.source,
+                precedingContext: segment.precedingContext,
+                followingContext: segment.followingContext,
+                using: model
+            )
+            polishedSegments.append(
+                Segment(source: segment.source, polished: polished)
+            )
+        } catch {
+            // The recording continues uninterrupted. finalize() will detect the
+            // flag and retry the complete transcript through the normal path.
+            encounteredFailure = true
+        }
+    }
+
+    /// Polishes a final range a few sentences at a time. The tail of a
+    /// recording is normally one call; a long backlog is split at sentence
+    /// boundaries so the small model edits instead of summarizing.
     private func polishFinalRange(
         _ source: String,
         precedingContext: String,
         followingContext: String
     ) async throws -> String {
-        if source.count > TranscriptPolishPolicy.maximumChunkCharacters {
-            return try await processor.polish(source, using: model)
-        }
-        return try await processor.polishStreamingSegment(
-            source,
-            precedingContext: precedingContext,
-            followingContext: followingContext,
-            using: model
+        let pieces = TranscriptPolishPolicy.chunks(
+            from: source,
+            maximumCharacters: Self.finalRangeChunkCharacters
         )
+        guard pieces.count > 1 else {
+            return try await processor.polishStreamingSegment(
+                source,
+                precedingContext: precedingContext,
+                followingContext: followingContext,
+                using: model
+            )
+        }
+
+        var outputs: [String] = []
+        outputs.reserveCapacity(pieces.count)
+        for (index, piece) in pieces.enumerated() {
+            let preceding = index == 0
+                ? precedingContext
+                : StreamingTranscriptPolicy.trailingContext(of: pieces[index - 1])
+            let following = index + 1 == pieces.count
+                ? followingContext
+                : StreamingTranscriptPolicy.leadingContext(of: pieces[index + 1])
+            outputs.append(
+                try await processor.polishStreamingSegment(
+                    piece,
+                    precedingContext: preceding,
+                    followingContext: following,
+                    using: model
+                )
+            )
+        }
+        return outputs.joined(separator: " ")
     }
 
     private func wholeTranscriptResult(
@@ -257,30 +447,6 @@ actor StreamingTranscriptPolisher {
         )
     }
 
-    private func process(
-        _ source: String,
-        followingContext: String
-    ) async {
-        do {
-            let polished = try await processor.polishStreamingSegment(
-                source,
-                precedingContext: StreamingTranscriptPolicy.trailingContext(
-                    of: previousSourceContext
-                ),
-                followingContext: followingContext,
-                using: model
-            )
-            polishedSegments.append(
-                Segment(source: source, polished: polished)
-            )
-            previousSourceContext = source
-        } catch {
-            // The recording continues uninterrupted. finalize() will detect the
-            // flag and retry the complete transcript through the normal path.
-            encounteredFailure = true
-        }
-    }
-
     private func polishWholeTranscriptOrUseRaw(_ transcript: String) async -> String {
         do {
             return try await processor.polish(transcript, using: model)
@@ -288,7 +454,55 @@ actor StreamingTranscriptPolisher {
             return transcript
         }
     }
+}
 
+/// Tracks which sentences have already been handed to the polisher so each
+/// cumulative ASR checkpoint emits only new or revised text, in transcript
+/// order. A revised sentence is simply emitted again; stale versions are
+/// ignored by the exact-word anchoring at release.
+struct StreamingEmissionTracker: Sendable {
+    private(set) var emittedSegments: [String] = []
+
+    mutating func newRanges(in stableText: String) -> [StreamingStableRange] {
+        let text = stableText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return [] }
+
+        guard let plan = StreamingTranscriptReconciler.anchoredPlan(
+            in: text,
+            processedSegments: emittedSegments
+        ) else {
+            emittedSegments = StreamingTranscriptPolicy.sentenceSegments(in: text)
+            return [
+                StreamingStableRange(
+                    source: text,
+                    precedingContext: "",
+                    followingContext: ""
+                ),
+            ]
+        }
+
+        var ranges: [StreamingStableRange] = []
+        var orderedSegments: [String] = []
+        for piece in plan.pieces {
+            switch piece {
+            case let .reusedSegment(index, _):
+                orderedSegments.append(emittedSegments[index])
+            case let .unprocessedRange(source, precedingContext, followingContext, _):
+                ranges.append(
+                    StreamingStableRange(
+                        source: source,
+                        precedingContext: precedingContext,
+                        followingContext: followingContext
+                    )
+                )
+                orderedSegments.append(
+                    contentsOf: StreamingTranscriptPolicy.sentenceSegments(in: source)
+                )
+            }
+        }
+        emittedSegments = orderedSegments
+        return ranges
+    }
 }
 
 enum StreamingTranscriptPolicy {
@@ -300,6 +514,14 @@ enum StreamingTranscriptPolicy {
         "\"", "'", "”", "’", ")", "]", "}", "»", "›"
     ]
 
+    static func isStrongTerminator(_ character: Character) -> Bool {
+        strongTerminators.contains(character)
+    }
+
+    static func isClosingCharacter(_ character: Character) -> Bool {
+        closingCharacters.contains(character)
+    }
+
     static func endsAtStrongBoundary(_ text: String) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         var characters = Array(trimmed)
@@ -310,34 +532,49 @@ enum StreamingTranscriptPolicy {
         return strongTerminators.contains(last)
     }
 
-    /// Returns only sentence text that has at least one later strong boundary.
-    /// Holding the newest apparent sentence avoids committing abbreviations or
-    /// punctuation that cumulative ASR may revise at the next checkpoint.
-    static func stablePrefix(of text: String) -> String {
+    /// Returns the complete sentences of a cumulative ASR snapshot that end at
+    /// least `minimumTrailingWords` words before the snapshot's edge. A cut
+    /// mid-word can only corrupt the final words of a snapshot, so a sentence
+    /// boundary followed by several more words was heard in full.
+    static func committedSentencePrefix(
+        of text: String,
+        minimumTrailingWords: Int
+    ) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let characters = Array(trimmed)
         guard !characters.isEmpty else { return "" }
 
-        let boundaries = strongBoundaryEnds(in: characters)
-
-        guard boundaries.count >= 2 else { return "" }
-        let stableEnd = boundaries[boundaries.count - 2]
-        return String(characters[..<stableEnd])
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        for boundary in strongBoundaryEnds(in: characters).reversed() {
+            let trailing = String(characters[boundary...])
+            guard StreamingTranscriptReconciler.wordCount(in: trailing)
+                >= minimumTrailingWords else { continue }
+            return String(characters[..<boundary])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return ""
     }
 
-    /// Consecutive cumulative ASR snapshots provide stronger evidence than a
-    /// single snapshot. Once their shared prefix includes a complete sentence,
-    /// that newest confirmed sentence can be polished immediately instead of
-    /// holding an extra sentence until release.
-    static func completeSentencePrefix(of text: String) -> String {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let characters = Array(trimmed)
-        guard let completeEnd = strongBoundaryEnds(in: characters).last else {
-            return ""
+    /// Splits text into sentences, then joins any sentence with fewer than
+    /// `minimumWords` words onto the sentence that follows it.
+    static func sentenceSegments(
+        in text: String,
+        mergingSegmentsShorterThan minimumWords: Int
+    ) -> [String] {
+        var merged: [String] = []
+        var carried = ""
+        for sentence in sentenceSegments(in: text) {
+            let combined = carried.isEmpty ? sentence : carried + " " + sentence
+            if StreamingTranscriptReconciler.wordCount(in: combined) < minimumWords {
+                carried = combined
+            } else {
+                merged.append(combined)
+                carried = ""
+            }
         }
-        return String(characters[..<completeEnd])
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !carried.isEmpty {
+            merged.append(carried)
+        }
+        return merged
     }
 
     static func sentenceSegments(in text: String) -> [String] {
@@ -369,6 +606,26 @@ enum StreamingTranscriptPolicy {
 
     static func trailingContext(of text: String) -> String {
         contextSlice(text, fromEnd: true)
+    }
+
+    /// Whether the text has a sentence boundary immediately after the word
+    /// ending at `wordEnd`: only punctuation and closing quotes may follow
+    /// before whitespace or the end of the text, and one of them must be a
+    /// strong terminator. "1.10.32" therefore has no boundary after "1".
+    static func hasStrongBoundary(after wordEnd: String.Index, in text: String) -> Bool {
+        var cursor = wordEnd
+        var sawTerminator = false
+        while cursor < text.endIndex {
+            let character = text[cursor]
+            if character.isWhitespace { break }
+            if strongTerminators.contains(character) {
+                sawTerminator = true
+            } else if character.isLetter || character.isNumber {
+                return false
+            }
+            cursor = text.index(after: cursor)
+        }
+        return sawTerminator || cursor == text.endIndex
     }
 
     private static func contextSlice(_ text: String, fromEnd: Bool) -> String {
@@ -446,9 +703,14 @@ enum StreamingTranscriptReconciler {
     }
 
     /// Reuses every completed Qwen segment whose complete normalized word span
-    /// still exists in the final ASR transcript. Revised gaps between those
-    /// anchors are returned as independent ranges for Qwen to process again.
-    /// Ambiguous out-of-position matches are never used as anchors.
+    /// still exists in the final ASR transcript at a matching sentence
+    /// boundary. Revised gaps between those anchors are returned as
+    /// independent ranges for Qwen to process again. Ambiguous out-of-position
+    /// matches are never used as anchors.
+    ///
+    /// Segments are first matched in their emission order; segments that were
+    /// re-emitted later (a revised sentence) are then placed by their unique
+    /// occurrence, so the plan always follows transcript order.
     static func anchoredPlan(
         in finalTranscript: String,
         processedSegments: [String]
@@ -457,11 +719,25 @@ enum StreamingTranscriptReconciler {
         guard !finalWords.isEmpty, !processedSegments.isEmpty else { return nil }
 
         let normalizedFinalWords = finalWords.map(\.normalized)
+        let segmentWordLists = processedSegments.map { words(in: $0).map(\.normalized) }
         var anchors: [Anchor] = []
         var searchCursor = 0
+        var deferredSegments: [Int] = []
 
-        for (segmentIndex, segment) in processedSegments.enumerated() {
-            let segmentWords = words(in: segment).map(\.normalized)
+        func isValidAnchor(segmentIndex: Int, start: Int) -> Bool {
+            let range = start..<(start + segmentWordLists[segmentIndex].count)
+            guard !anchors.contains(where: { $0.finalWordRange.overlaps(range) }) else {
+                return false
+            }
+            return boundariesAgree(
+                segment: processedSegments[segmentIndex],
+                finalTranscript: finalTranscript,
+                finalWords: finalWords,
+                range: range
+            )
+        }
+
+        for (segmentIndex, segmentWords) in segmentWordLists.enumerated() {
             guard !segmentWords.isEmpty else { continue }
 
             let occurrences = exactOccurrences(
@@ -469,34 +745,54 @@ enum StreamingTranscriptReconciler {
                 in: normalizedFinalWords,
                 startingAt: searchCursor
             )
-            guard !occurrences.isEmpty else { continue }
-
             let anchorStart: Int
-            if occurrences[0] == searchCursor {
-                anchorStart = searchCursor
-            } else {
+            if let first = occurrences.first,
+               first == searchCursor,
+               isValidAnchor(segmentIndex: segmentIndex, start: first) {
+                anchorStart = first
+            } else if segmentWords.count >= 4,
+                      occurrences.count == 1,
+                      isValidAnchor(segmentIndex: segmentIndex, start: occurrences[0]) {
                 // Away from the expected cursor, short or repeated phrases are
                 // too weak to identify ownership safely.
-                guard segmentWords.count >= 4, occurrences.count == 1 else {
-                    continue
-                }
                 anchorStart = occurrences[0]
+            } else {
+                deferredSegments.append(segmentIndex)
+                continue
             }
 
             let anchorEnd = anchorStart + segmentWords.count
             anchors.append(
-                Anchor(
-                    segmentIndex: segmentIndex,
-                    finalWordRange: anchorStart..<anchorEnd
-                )
+                Anchor(segmentIndex: segmentIndex, finalWordRange: anchorStart..<anchorEnd)
             )
             searchCursor = anchorEnd
         }
 
+        for segmentIndex in deferredSegments {
+            let segmentWords = segmentWordLists[segmentIndex]
+            guard segmentWords.count >= 4 else { continue }
+            let occurrences = exactOccurrences(
+                of: segmentWords,
+                in: normalizedFinalWords,
+                startingAt: 0
+            )
+            guard occurrences.count == 1,
+                  isValidAnchor(segmentIndex: segmentIndex, start: occurrences[0]) else {
+                continue
+            }
+            anchors.append(
+                Anchor(
+                    segmentIndex: segmentIndex,
+                    finalWordRange: occurrences[0]..<(occurrences[0] + segmentWords.count)
+                )
+            )
+        }
+        guard !anchors.isEmpty else { return nil }
+        anchors.sort { $0.finalWordRange.lowerBound < $1.finalWordRange.lowerBound }
+
         let reusedWordCount = anchors.reduce(0) {
             $0 + $1.finalWordRange.count
         }
-        guard reusedWordCount >= min(4, finalWords.count) else { return nil }
 
         var pieces: [AnchoredPlan.Piece] = []
         var finalWordCursor = 0
@@ -565,6 +861,58 @@ enum StreamingTranscriptReconciler {
         words(in: text).count
     }
 
+    /// Returns the part of `windowTranscript` that follows the last words of
+    /// `committedText`, or nil when those words cannot be located. Used at
+    /// release to extract the uncommitted tail from a short pass over the last
+    /// seconds of audio.
+    static func textFollowing(
+        committedText: String,
+        in windowTranscript: String
+    ) -> String? {
+        let anchorLength = 4
+        let committedWords = words(in: committedText).map(\.normalized)
+        guard committedWords.count >= anchorLength else { return nil }
+        let anchor = Array(committedWords.suffix(anchorLength))
+
+        let windowWords = words(in: windowTranscript)
+        let occurrences = exactOccurrences(
+            of: anchor,
+            in: windowWords.map(\.normalized),
+            startingAt: 0
+        )
+        guard let anchorStart = occurrences.last else { return nil }
+
+        let tailWordIndex = anchorStart + anchorLength
+        guard tailWordIndex < windowWords.count else { return nil }
+        let tail = String(windowTranscript[windowWords[tailWordIndex].range.lowerBound...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return tail.isEmpty ? nil : tail
+    }
+
+    /// A polished segment was capitalized and punctuated as a sentence of its
+    /// own. Reusing it is only safe where the final transcript also starts a
+    /// sentence at its first word and ends one at its last word, exactly when
+    /// the segment does; otherwise "a treatise." would be pasted mid-sentence.
+    private static func boundariesAgree(
+        segment: String,
+        finalTranscript: String,
+        finalWords: [Word],
+        range: Range<Int>
+    ) -> Bool {
+        let startsSentence = range.lowerBound == 0
+            || StreamingTranscriptPolicy.hasStrongBoundary(
+                after: finalWords[range.lowerBound - 1].range.upperBound,
+                in: finalTranscript
+            )
+        guard startsSentence else { return false }
+
+        let finalEndsSentence = StreamingTranscriptPolicy.hasStrongBoundary(
+            after: finalWords[range.upperBound - 1].range.upperBound,
+            in: finalTranscript
+        )
+        return finalEndsSentence == StreamingTranscriptPolicy.endsAtStrongBoundary(segment)
+    }
+
     private static func exactOccurrences(
         of needle: [String],
         in haystack: [String],
@@ -588,66 +936,6 @@ enum StreamingTranscriptReconciler {
             }
         }
         return result
-    }
-
-    /// Returns the final transcript suffix that has not already been processed,
-    /// but only when the processed text is still an exact normalized prefix.
-    /// Punctuation and capitalization may change during final token decoding;
-    /// meaningful word changes force a full-pass fallback.
-    static func unprocessedSuffix(
-        in finalTranscript: String,
-        afterProcessedPrefix processedPrefix: String
-    ) -> String? {
-        let processedWords = words(in: processedPrefix).map(\.normalized)
-        let finalWords = words(in: finalTranscript)
-
-        guard !processedWords.isEmpty else {
-            return finalTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        guard processedWords.count <= finalWords.count else { return nil }
-        guard zip(processedWords, finalWords).allSatisfy({ lhs, rhs in
-            lhs == rhs.normalized
-        }) else {
-            return nil
-        }
-
-        guard processedWords.count < finalWords.count else { return "" }
-        let suffixStart = finalWords[processedWords.count].range.lowerBound
-        return String(finalTranscript[suffixStart...])
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    /// Returns the word prefix shared by two consecutive cumulative ASR
-    /// snapshots, retaining a small uncommitted tail. Unlike fixed time
-    /// windows, this can never split a recognized word at an audio seam.
-    static func confirmedPrefix(
-        in currentTranscript: String,
-        against previousTranscript: String,
-        holdingBack holdbackWords: Int
-    ) -> String {
-        let currentWords = words(in: currentTranscript)
-        let previousWords = words(in: previousTranscript)
-        guard !currentWords.isEmpty, !previousWords.isEmpty else { return "" }
-
-        var commonWordCount = 0
-        while commonWordCount < currentWords.count,
-              commonWordCount < previousWords.count,
-              currentWords[commonWordCount].normalized
-                == previousWords[commonWordCount].normalized {
-            commonWordCount += 1
-        }
-
-        let confirmedWordCount = max(0, commonWordCount - max(0, holdbackWords))
-        guard confirmedWordCount > 0 else { return "" }
-
-        let prefixEnd: String.Index
-        if confirmedWordCount < currentWords.count {
-            prefixEnd = currentWords[confirmedWordCount].range.lowerBound
-        } else {
-            prefixEnd = currentTranscript.endIndex
-        }
-        return String(currentTranscript[..<prefixEnd])
-            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func words(in text: String) -> [Word] {
