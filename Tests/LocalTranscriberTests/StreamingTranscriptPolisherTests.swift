@@ -118,52 +118,6 @@ final class StreamingTranscriptPolisherTests: XCTestCase {
         )
     }
 
-    func testTextFollowingCommittedTextExtractsTheTail() {
-        let committed = "Lorem Ipsum is simply dummy text. It has survived not only many decades."
-        XCTAssertEqual(
-            StreamingTranscriptReconciler.textFollowing(
-                committedText: committed,
-                in: "vived not only many decades. But also the leap into electronic typesetting."
-            ),
-            "But also the leap into electronic typesetting."
-        )
-        XCTAssertNil(
-            StreamingTranscriptReconciler.textFollowing(
-                committedText: committed,
-                in: "completely different words appear in this window."
-            )
-        )
-        XCTAssertNil(
-            StreamingTranscriptReconciler.textFollowing(
-                committedText: committed,
-                in: "not only many decades."
-            )
-        )
-    }
-
-    func testTerminalRangePolishesShortAndUnfinishedTextImmediately() async {
-        let processor = RecordingTranscriptPolisher()
-        let pipeline = StreamingTranscriptPolisher(
-            isEnabled: true,
-            model: .qwen3_0_6b,
-            processor: processor
-        )
-
-        await pipeline.consumeStableSegment(
-            StreamingStableRange(
-                source: "Thank you",
-                precedingContext: "That is everything I wanted to say.",
-                followingContext: "",
-                isTerminal: true
-            )
-        )
-        await pipeline.waitForQueuedWork()
-
-        let calls = await processor.streamingCalls
-        XCTAssertEqual(calls.map(\.transcript), ["Thank you"])
-        XCTAssertEqual(calls.first?.precedingContext, "That is everything I wanted to say.")
-    }
-
     func testAnchorsRequireMatchingSentenceBoundaries() async {
         let processor = RecordingTranscriptPolisher()
         let pipeline = StreamingTranscriptPolisher(

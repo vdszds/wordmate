@@ -345,11 +345,7 @@ final class StreamingAudioPipelineBenchmarkTests: XCTestCase {
         let inFlightAtRelease = checkpoints.contains {
             $0.startedAt < releasedAt && $0.finishedAt > releasedAt
         }
-        if let tail = events.first(where: { $0.kind == .speculativeTail }) {
-            print("PARAKEET_SPECULATIVE_TAIL_SECONDS=\(format(tail.transcriptionSeconds))")
-        } else {
-            print("PARAKEET_SPECULATIVE_TAIL_SECONDS=none")
-        }
+
         let checkpointSeconds = checkpoints.reduce(0.0) { $0 + $1.transcriptionSeconds }
         print("PARAKEET_CHECKPOINTS=\(checkpoints.count)")
         print("PARAKEET_CHECKPOINT_SECONDS=\(format(checkpointSeconds))")

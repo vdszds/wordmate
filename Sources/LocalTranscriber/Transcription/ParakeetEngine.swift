@@ -100,7 +100,6 @@ final class ParakeetEngine {
         var nextCheckpoint = checkpointInterval
         var accumulator = LiveAudioAccumulator()
         var tracker = StreamingEmissionTracker()
-        var committedText = ""
         let clock = ContinuousClock()
 
         for await chunk in audioChunks {
@@ -135,53 +134,10 @@ final class ParakeetEngine {
             for range in tracker.newRanges(in: stableText) {
                 await onStableSegment(range)
             }
-            if !stableText.isEmpty {
-                committedText = stableText
-            }
         }
 
         try Task.checkCancellation()
         let finalSamples = try accumulator.mono16kSamples()
-
-        // Speculative tail: a short pass over the last seconds of audio finds
-        // the text after the last committed sentence, so Qwen can polish it
-        // while the authoritative pass runs. The final reconciliation reuses
-        // that work only if the whole-recording transcript matches it word
-        // for word; otherwise the tail is simply polished again.
-        let tailSampleCount = Int(Self.speculativeTailSeconds * AudioSampleLoader.sampleRate)
-        if !committedText.isEmpty,
-           finalSamples.count > tailSampleCount + Int(AudioSampleLoader.sampleRate) {
-            let tailSamples = Array(finalSamples.suffix(tailSampleCount))
-            let tailStarted = clock.now
-            let tailTranscript = TranscriptCleaner.clean(
-                try await transcribe(tailSamples, with: manager)
-            )
-            let tailFinished = clock.now
-            onCheckpoint?(
-                StreamingCheckpointEvent(
-                    kind: .speculativeTail,
-                    audioSeconds: Double(tailSamples.count) / AudioSampleLoader.sampleRate,
-                    transcriptionSeconds: Self.seconds(tailStarted.duration(to: tailFinished)),
-                    startedAt: tailStarted,
-                    finishedAt: tailFinished
-                )
-            )
-            if let tail = StreamingTranscriptReconciler.textFollowing(
-                committedText: committedText,
-                in: tailTranscript
-            ) {
-                await onStableSegment(
-                    StreamingStableRange(
-                        source: tail,
-                        precedingContext: StreamingTranscriptPolicy.trailingContext(
-                            of: committedText
-                        ),
-                        followingContext: "",
-                        isTerminal: true
-                    )
-                )
-            }
-        }
 
         let finalStarted = clock.now
         let finalTranscript = try await transcribe(finalSamples, with: manager)
@@ -197,11 +153,6 @@ final class ParakeetEngine {
         )
         return finalTranscript
     }
-
-    /// Audio window transcribed at release to locate the uncommitted tail.
-    /// It must reach back past the end of the last committed sentence, so it
-    /// covers the checkpoint interval plus a long sentence in progress.
-    static let speculativeTailSeconds: TimeInterval = 12
 
     private static func seconds(_ duration: Duration) -> Double {
         Double(duration.components.seconds)

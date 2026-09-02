@@ -57,23 +57,6 @@ struct StreamingStableRange: Sendable, Equatable {
     let source: String
     let precedingContext: String
     let followingContext: String
-
-    /// True when no further text can follow this range (the speculative tail
-    /// emitted at release), so short or unfinished sentences are polished at
-    /// once instead of waiting for later context.
-    let isTerminal: Bool
-
-    init(
-        source: String,
-        precedingContext: String,
-        followingContext: String,
-        isTerminal: Bool = false
-    ) {
-        self.source = source
-        self.precedingContext = precedingContext
-        self.followingContext = followingContext
-        self.isTerminal = isTerminal
-    }
 }
 
 /// One Parakeet pass made by the streaming loop.
@@ -81,9 +64,6 @@ struct StreamingCheckpointEvent: Sendable {
     enum Kind: String, Sendable {
         /// Cumulative transcription while recording.
         case checkpoint
-        /// Short pass over the last seconds of audio at release, used to
-        /// start polishing the tail while the final pass runs.
-        case speculativeTail
         /// Authoritative whole-recording pass after release.
         case finalPass
     }
@@ -215,9 +195,7 @@ actor StreamingTranscriptPolisher {
             )
             let isShort = StreamingTranscriptReconciler.wordCount(in: sentence)
                 < Self.minimumSegmentWords
-            if range.isTerminal {
-                enqueue(queued)
-            } else if isLast, isShort {
+            if isLast, isShort {
                 pendingSegment = queued
             } else if StreamingTranscriptPolicy.endsAtStrongBoundary(sentence)
                 || !followingContext.isEmpty {
@@ -859,34 +837,6 @@ enum StreamingTranscriptReconciler {
 
     static func wordCount(in text: String) -> Int {
         words(in: text).count
-    }
-
-    /// Returns the part of `windowTranscript` that follows the last words of
-    /// `committedText`, or nil when those words cannot be located. Used at
-    /// release to extract the uncommitted tail from a short pass over the last
-    /// seconds of audio.
-    static func textFollowing(
-        committedText: String,
-        in windowTranscript: String
-    ) -> String? {
-        let anchorLength = 4
-        let committedWords = words(in: committedText).map(\.normalized)
-        guard committedWords.count >= anchorLength else { return nil }
-        let anchor = Array(committedWords.suffix(anchorLength))
-
-        let windowWords = words(in: windowTranscript)
-        let occurrences = exactOccurrences(
-            of: anchor,
-            in: windowWords.map(\.normalized),
-            startingAt: 0
-        )
-        guard let anchorStart = occurrences.last else { return nil }
-
-        let tailWordIndex = anchorStart + anchorLength
-        guard tailWordIndex < windowWords.count else { return nil }
-        let tail = String(windowTranscript[windowWords[tailWordIndex].range.lowerBound...])
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return tail.isEmpty ? nil : tail
     }
 
     /// A polished segment was capitalized and punctuated as a sentence of its
