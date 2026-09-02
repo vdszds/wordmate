@@ -39,4 +39,5 @@ final class BenchmarkResultTests: XCTestCase {
             1
         )
     }
+
 }

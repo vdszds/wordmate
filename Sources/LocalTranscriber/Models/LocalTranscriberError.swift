@@ -5,6 +5,7 @@ enum LocalTranscriberError: LocalizedError {
     case notRecording
     case microphonePermissionDenied
     case audioInputConfigurationFailed(String)
+    case microphoneUnavailable(String)
     case couldNotStartRecording
     case missingRecording
     case emptyRecording
@@ -29,6 +30,8 @@ enum LocalTranscriberError: LocalizedError {
             return "Microphone access is disabled. Enable it in System Settings → Privacy & Security → Microphone."
         case let .audioInputConfigurationFailed(name):
             return "The microphone “\(name)” could not be selected."
+        case let .microphoneUnavailable(message):
+            return message
         case .couldNotStartRecording:
             return "The microphone recording could not be started."
         case .missingRecording:
