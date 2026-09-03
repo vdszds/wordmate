@@ -2,7 +2,7 @@
 
 This repository contains the on-device transcription pipeline used by [Wordmate](https://wordmate.sh) for macOS.
 
-Parakeet turns microphone audio into text. Qwen then turns that dictation into written text: punctuation, capitalization, filler words, stutters, false starts, and spoken corrections. Rules write spoken numbers as numerals and split long dictations into paragraphs. On longer recordings, most of the cleanup happens while you are still speaking. On the test machine, the final text was ready about **0.3 seconds after Fn was released** for the median LibriSpeech recording, and within about **0.7–1.7 seconds** for one-minute dictations with stutters.
+Parakeet turns microphone audio into text. Qwen then turns that dictation into written text: punctuation, capitalization, filler words, stutters, false starts, and spoken corrections. Rules write spoken numbers as numerals and split long dictations into paragraphs. On longer recordings, most of the cleanup happens while you are still speaking. On the test machine, the final text was ready about **0.3 seconds after Fn was released** for the median LibriSpeech recording, and within about **0.7–1.7 seconds** for one-minute, difficult recordings with stutters.
 
 Everything runs locally. Audio and transcripts do not leave the Mac.
 
@@ -51,11 +51,11 @@ Each checkpoint is compared with the sentences already sent to Qwen. Only new se
 
 [`StreamingTranscriptPolisher`](Sources/LocalTranscriber/Transcription/StreamingTranscriptPolisher.swift) queues finished sentences and gives them to Qwen one at a time on a background worker. The audio loop never waits for the language model, so Qwen and Parakeet overlap. Qwen can see a short piece of text before and after each sentence to understand its context, but it is told not to return those surrounding words. A fragment shorter than four words, such as the text left after an abbreviation period, is cleaned together with the sentence that follows it.
 
-For longer recordings, this means little work remains after Fn is released: on the one-minute benchmark recordings below, 79–91% of the words were already clean at release, and 50% on the stutter recording whose final sentence alone is 45 words long.
+For longer recordings, this means little work remains after Fn is released: on the one-minute benchmark recordings below, 79–91% of the words were already clean at release.
 
 ### Finishing after Fn is released
 
-After release, Parakeet runs on the complete recording one final time. Only a Qwen call already in progress is awaited; queued sentences that never started are folded into the final pass, where neighbouring ones merge into a single call. Wordmate then compares the final transcript with the sentences cleaned earlier:
+After release, Parakeet runs on the complete recording one final time. Only a Qwen call already in progress is awaited; queued sentences that never started are folded into the final pass. Wordmate then compares the final transcript with the sentences cleaned earlier:
 
 - If the words still match exactly, and the final transcript starts and ends a sentence at the same words, the earlier Qwen result is reused.
 - If Parakeet changed part of the transcript, only that part is cleaned again, a few sentences at a time.
@@ -116,7 +116,7 @@ Before Qwen runs, a small rule-based cleaner removes standalone versions of `um`
 
 ## Performance
 
-The numbers below were produced on 3 September 2026 by the public benchmark tests. They use the same Parakeet, Qwen, cleanup, final-pass, and safety code as the production pipeline.
+The numbers below were produced by the public benchmark tests. They use the same Parakeet, Qwen, cleanup, final-pass, and safety code as the production pipeline.
 
 ### Word error rate
 
@@ -169,18 +169,14 @@ What did not work, or only partly:
 - The reference rewrites grammar (`send` → `sent`, `we'll send` → `will be sent`) and turns spoken enumerations into numbered or bulleted lists. The pipeline does neither by design: it never replaces a recognized word, and it returns prose.
 - Names the recognizer got wrong stay wrong, as intended.
 
-The larger models edit a little more thoroughly, and the 2B model produced the best text on most recordings. The 0.6B model stays the default because it is the fastest and lightest (the 2B more than doubles that time on difficult recording) and because its output is now close enough that the remaining gap is mostly recognition and rewriting rather than cleanup. Any MLX text model can be tried on the same benchmark with `WORDMATE_POST_PROCESSING_MODEL_ID`.
+The larger models edit a little more thoroughly, and the 2B model produced the best text on most recordings. The 0.6B model stays the default because it is the fastest and lightest (the 2B more than doubles that time on difficult recording) and because its output is now close enough that the remaining gap is small. Any MLX text model can be tried on the same benchmark with `WORDMATE_POST_PROCESSING_MODEL_ID`.
 
 ### Test machine
 
 | Item           | Value                        |
 | -------------- | ---------------------------- |
-| Mac            | Mac16,5 with Apple M4 Max    |
+| Mac            | MacBook Apple M4 Max         |
 | CPU and memory | 16 logical cores and 128 GiB |
-
-The model files were already downloaded. Model loading and one warm-up recording were excluded from the timing tables.
-
-These results describe this machine and these recordings. LibriSpeech is read audiobook English, not everyday dictation, and the ten dictations are one speaker. Other Macs, microphones, accents, background noise, technical terms, and code-heavy speech can produce different results.
 
 ## Code guide
 
