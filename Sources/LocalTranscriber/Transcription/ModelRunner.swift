@@ -33,9 +33,23 @@ actor ModelRunner {
         onStableSegment: @escaping @Sendable (StreamingStableRange) async -> Void,
         onCheckpoint: (@Sendable (StreamingCheckpointEvent) -> Void)? = nil
     ) async throws -> String {
+        try await transcribeStreamingWithTimings(
+            audioChunks,
+            using: engine,
+            onStableSegment: onStableSegment,
+            onCheckpoint: onCheckpoint
+        ).transcript
+    }
+
+    func transcribeStreamingWithTimings(
+        _ audioChunks: AsyncStream<LiveAudioChunk>,
+        using engine: EngineChoice,
+        onStableSegment: @escaping @Sendable (StreamingStableRange) async -> Void,
+        onCheckpoint: (@Sendable (StreamingCheckpointEvent) -> Void)? = nil
+    ) async throws -> TimedTranscript {
         switch engine {
         case .parakeet:
-            return try await parakeet.transcribeStreaming(
+            return try await parakeet.transcribeStreamingWithTimings(
                 audioChunks,
                 onStableSegment: onStableSegment,
                 onCheckpoint: onCheckpoint

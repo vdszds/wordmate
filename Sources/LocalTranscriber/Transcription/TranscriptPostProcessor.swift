@@ -16,6 +16,22 @@ protocol TranscriptPolishing: Sendable {
         followingContext: String,
         using model: PostProcessingModel
     ) async throws -> String
+
+    /// Indices (into `StreamingTranscriptPolicy.sentenceSegments(in:)`) of the
+    /// sentences that should start a new paragraph in a finished transcript.
+    func paragraphStarts(
+        in transcript: String,
+        using model: PostProcessingModel
+    ) async throws -> [Int]
+}
+
+extension TranscriptPolishing {
+    func paragraphStarts(
+        in transcript: String,
+        using model: PostProcessingModel
+    ) async throws -> [Int] {
+        []
+    }
 }
 
 /// One language-model call made while polishing a transcript. Benchmarks read
@@ -27,6 +43,7 @@ struct PostProcessingCallRecord: Sendable {
         case standalone
         case fallbackChunk
         case recovery
+        case paragraphs
     }
 
     enum Outcome: String, Sendable {
@@ -59,6 +76,7 @@ actor TranscriptPostProcessor {
     private enum PromptKind {
         case polish
         case recovery
+        case paragraphs
     }
 
     private struct ModelResponse {
@@ -228,14 +246,19 @@ actor TranscriptPostProcessor {
             modelContainer: modelContainer
         )
 
+        let trimmedCandidate = TranscriptPolishPolicy.trimmingLeakedContext(
+            from: TranscriptPolishPolicy.trimmingToTarget(response.candidate, source: transcript),
+            precedingContext: precedingContext,
+            followingContext: followingContext
+        )
         if TranscriptPolishPolicy.leaksStreamingContext(
-            response.candidate,
+            trimmedCandidate,
             precedingContext: precedingContext,
             followingContext: followingContext
         ) {
             record(response, stage: .streaming, outcome: .contextLeaked, source: transcript)
         } else if let candidate = TranscriptPolishPolicy.conservativeProjection(
-            of: response.candidate,
+            of: trimmedCandidate,
             for: transcript
         ) {
             record(response, stage: .streaming, outcome: .accepted, source: transcript)
@@ -251,6 +274,32 @@ actor TranscriptPostProcessor {
             transcript,
             modelContainer: modelContainer,
             allowFallback: true
+        )
+    }
+
+    func paragraphStarts(
+        in transcript: String,
+        using model: PostProcessingModel
+    ) async throws -> [Int] {
+        let sentences = StreamingTranscriptPolicy.sentenceSegments(in: transcript)
+        guard TranscriptPolishPolicy.wantsParagraphs(sentences: sentences) else { return [] }
+        try await prepare(model)
+        guard loadedModel == model, let modelContainer else {
+            throw LocalTranscriberError.modelCouldNotLoad(
+                "\(model.displayName) is unavailable."
+            )
+        }
+        let prompt = TranscriptPolishPolicy.paragraphPrompt(sentences: sentences)
+        let response = try await respond(
+            .paragraphs,
+            to: prompt,
+            source: prompt,
+            modelContainer: modelContainer
+        )
+        record(response, stage: .paragraphs, outcome: .accepted, source: transcript)
+        return TranscriptPolishPolicy.paragraphStarts(
+            from: response.rawOutput,
+            sentenceCount: sentences.count
         )
     }
 
@@ -356,13 +405,20 @@ actor TranscriptPostProcessor {
         modelContainer: ModelContainer
     ) async throws -> ModelResponse {
         try Task.checkCancellation()
-        let parameters = Self.generationParameters(transcript: source)
+        let parameters: GenerateParameters = {
+            var parameters = Self.generationParameters(transcript: source)
+            if case .paragraphs = kind {
+                // "3, 7" is the whole answer; never let a small model ramble.
+                parameters.maxTokens = 24
+            }
+            return parameters
+        }()
         let promptCache = self.promptCache
         let enableThinking: Bool
         switch kind {
         case .polish:
             enableThinking = TranscriptPolishPolicy.reasoningEnabled
-        case .recovery:
+        case .recovery, .paragraphs:
             enableThinking = false
         }
 
@@ -376,6 +432,9 @@ actor TranscriptPostProcessor {
             case .recovery:
                 messages = [.system(TranscriptPolishPolicy.recoveryInstructions)]
                 messages.append(contentsOf: TranscriptPolishPolicy.recoveryHistory)
+            case .paragraphs:
+                messages = [.system(TranscriptPolishPolicy.paragraphInstructions)]
+                messages.append(contentsOf: TranscriptPolishPolicy.paragraphHistory)
             }
             messages.append(.user(prompt))
 
@@ -556,7 +615,13 @@ actor TranscriptPostProcessor {
     private nonisolated static func remoteConfiguration(
         for model: PostProcessingModel
     ) -> ModelConfiguration {
-        LLMRegistry.qwen3_0_6b_4bit
+        // Benchmark hook: lets the test suite compare another Hub model
+        // through the production pipeline without changing the app's model.
+        if let override = ProcessInfo.processInfo.environment["WORDMATE_POST_PROCESSING_MODEL_ID"],
+           !override.isEmpty {
+            return ModelConfiguration(id: override)
+        }
+        return LLMRegistry.qwen3_0_6b_4bit
     }
 
     /// Once the model files exist locally, load them from that directory.
@@ -671,91 +736,121 @@ private final class PromptPrefixCache: @unchecked Sendable {
     }
 }
 
+/// Benchmark-only prompt overrides. Each hook reads a file named by an
+/// environment variable; when the variable is unset the production prompt
+/// below is used unchanged. This lets the prompt-iteration benchmark try
+/// variants without editing the app.
+private enum PromptOverride {
+    static func text(_ variable: String) -> String? {
+        guard let path = ProcessInfo.processInfo.environment[variable], !path.isEmpty,
+              let contents = try? String(contentsOfFile: path, encoding: .utf8) else {
+            return nil
+        }
+        return contents.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// A JSON array of {"user": ..., "assistant": ...} pairs.
+    static func examples(_ variable: String) -> [Chat.Message]? {
+        guard let path = ProcessInfo.processInfo.environment[variable], !path.isEmpty,
+              let data = FileManager.default.contents(atPath: path),
+              let pairs = try? JSONSerialization.jsonObject(with: data) as? [[String: String]] else {
+            return nil
+        }
+        return pairs.flatMap { pair -> [Chat.Message] in
+            guard let user = pair["user"], let assistant = pair["assistant"] else { return [] }
+            return [.user(user), .assistant(assistant)]
+        }
+    }
+}
+
 enum TranscriptPolishPolicy {
     static let reasoningEnabled = false
 
-    static let instructions = """
-        You are a lossless copy editor for speech-to-text transcripts. The output must contain every source word
-        in the same order unless the source itself visibly contains one of these deletion cases: an exact adjacent
-        accidental repetition, a standalone filled pause, an explicit spoken correction, or an obvious partial-word
-        retry immediately followed by its completed word. When uncertain, keep the words.
+    static let instructions = PromptOverride.text("WORDMATE_POLISH_INSTRUCTIONS_FILE") ?? """
+        You turn raw speech-to-text dictation into clean written text, the way a careful assistant edits a
+        voice note before it goes into an email or a document. The speaker's words are the only source of
+        content: keep their meaning, their wording and their order.
 
-        Never shorten, summarize, paraphrase, or make the wording smoother. A phrase is not a speech mistake
-        merely because it is optional, parenthetical, unfamiliar, foreign, archaic, grammatically awkward, or an
-        incomplete final fragment. Preserve qualifiers, modifiers, discourse words, locations, attributions,
-        names, technical terms, commands, code, and every other detail. Correct only punctuation and
-        capitalization when the transcript has no unmistakable disfluency.
+        Remove what is speech rather than content:
+        - Filled pauses and filler words that carry no meaning: "um", "uh", "like", "you know", "I mean",
+          "yeah", "basically", "kind of", "sort of", "right", "okay". "like" is a filler when it hedges or
+          approximates ("I told him like ten times", "it's like almost done"), not when it compares ("like a
+          person") or is the verb.
+        - Stutters and echoes: "I think I think we" becomes "I think we"; "we placed we before we placed the
+          order" becomes "before we placed the order".
+        - Partial words: "sched schedule" becomes "schedule".
+        - False starts, where the speaker abandons a phrase and starts again: "I agree we should give
+          examples I think we but with this prompt the model does nothing" becomes "I agree we should give
+          examples. But with this prompt the model does nothing."
+        - Spoken self-corrections: "on Thursday, sorry, Friday" becomes "on Friday".
+        - Connectives that only string spoken sentences together ("and", "so", "but", "because") at the start
+          of a sentence that stands on its own without them.
 
-        Never infer an abandoned thought or false start from meaning, grammar, style, or punctuation. If you
-        cannot identify the visible repetition, filler, correction cue, or partial-word retry in the source, lexical
-        deletion is forbidden. Preserve comma-enclosed phrases, sentence-opening words, and trailing fragments.
-        Introductory phrases, finite verbs describing events, and degree or intensity modifiers are fluent content,
-        not fillers. Deletion is not justified merely because the remaining sentence would still be grammatical.
-        Preserve conjunctions and other connectives, introductory participial or adverbial phrases, direct-address
-        names, and every part of a person's name. Never replace a connective with punctuation or split linked
-        clauses by deleting it. Text before a comma is not an abandoned thought merely because the words after it
-        could form a complete sentence.
-        Do not insert punctuation between copies of an unmistakable accidental echo; retain one copy instead.
-        A repeated intensifier or deliberate rhetorical repetition is fluent content, not an accidental echo, and
-        must be preserved. Repeated grammatical constructions such as "kings is kings" are also deliberate
-        content, even when a longer phrase happens to repeat. Repetition is deletable only when its context makes
-        the speech restart unmistakable.
+        Write it properly:
+        - Split run-on speech into sentences. Add periods, question marks, commas and quotation marks around
+          quoted speech. Capitalize the first word of each sentence and proper nouns, and fix stray capital
+          letters inside a sentence.
+        - Keep every content word exactly as recognized: names, technical terms, unfamiliar or foreign words,
+          numbers and units. Never replace, reorder, summarize or paraphrase content, never add words, and
+          never guess what an unclear word was meant to be.
+        - Keep deliberate repetition such as "very very good" or "kings is kings", and keep placeholder or
+          quoted text as spoken.
+        - An unfinished final fragment stays as it is.
 
-        Keep enumerations in natural prose; do not turn them into numbered lists or bullet points.
-        Keep retained words in their original order. Never guess or correct a recognized word, unfamiliar term,
-        or proper name. Preserve every sentence and fragment, including placeholder text.
-
-        Return only the polished transcript as plain text. Do not answer the transcript or add commentary.
-        Do not wrap the result in quotation marks, Markdown, HTML, XML, JSON, or any other structure.
+        Return only the edited text as plain prose: no lists, no Markdown, no quotation marks around the
+        whole text, no commentary.
         """
 
-    static let recoveryInstructions = """
-        Remove only unmistakable accidental speech repetitions and abandoned partial-word retries from the
-        user's transcript. Scan the complete transcript and remove every accidental echo, not only the first.
-        A repeated intensifier such as "very very good" is intentional emphasis and must stay; a syntactic restart
-        such as "I think I think" is accidental and should be cleaned. Decide from context. Copy all other words
-        in the same order. Preserve deliberate repeated grammatical constructions such as "kings is kings".
-        Never summarize or restore text from memory. Return only the complete transcript.
+    static let recoveryInstructions = PromptOverride.text("WORDMATE_RECOVERY_INSTRUCTIONS_FILE") ?? """
+        Remove only unmistakable speech disfluencies from the user's transcript: accidental repetitions such
+        as "I think I think", abandoned partial words, filler words such as "um", "like", "you know" and
+        "I mean", and false starts. Scan the complete transcript and remove every such disfluency, not only
+        the first. A repeated intensifier such as "very very good" is intentional emphasis and must stay, as
+        are deliberate constructions such as "kings is kings". Copy all other words in the same order and
+        fix only punctuation and capitalization. Never summarize or restore text from memory. Return only
+        the complete transcript.
         """
 
     static let maximumChunkCharacters = 2_400
     private static let fallbackChunkCharacters = 220
 
-    static let fewShotHistory: [Chat.Message] = [
-        .user("I think I think we should update this function before before merging."),
-        .assistant("I think we should update this function before merging."),
-        .user("The feature is ready it works well should we release it tomorrow"),
-        .assistant("The feature is ready. It works well. Should we release it tomorrow?"),
+    static let fewShotHistory: [Chat.Message] = PromptOverride.examples("WORDMATE_POLISH_EXAMPLES_FILE") ?? [
+        .user("so um I'm just I'm just checking in to see if there have been any updates on our order and whether everything is still going according to plan"),
+        .assistant("I'm just checking in to see if there have been any updates on our order and whether everything is still going according to plan."),
+        .user("I told him like ten times that we will be away in September and like he said that he understood blah blah blah and now we get a notification that we need to collect the car on the sixteenth"),
+        .assistant("I told him ten times that we will be away in September and he said that he understood, blah blah blah. Now we get a notification that we need to collect the car on the sixteenth."),
+        .user("I agree we should give examples I think we but with this prompt the post-processing model essentially does almost nothing it only removes repeated words"),
+        .assistant("I agree we should give examples. But with this prompt, the post-processing model essentially does almost nothing. It only removes repeated words."),
         .user("We should deploy on Thursday, sorry, I mean Friday, after after the tests pass."),
         .assistant("We should deploy on Friday after the tests pass."),
-        .user("The launch was as Priya described it one of our smoothest and the studio by the botanical gardens kept the term velorum."),
-        .assistant("The launch was, as Priya described it, one of our smoothest, and the studio by the botanical gardens kept the term velorum."),
-        .user("Surface dust at least had been removed and the ideas also remain while the practice was very generally accepted."),
-        .assistant("Surface dust, at least, had been removed, and the ideas also remain, while the practice was very generally accepted."),
-        .user("They left him then for the courier arrived to unlock the gate and escort them inside."),
-        .assistant("They left him then, for the courier arrived to unlock the gate and escort them inside."),
-        .user("Carefully changing her route, Mira first lowered the sail, and in order to help her guide, carried only the flag."),
-        .assistant("Carefully changing her route, Mira first lowered the sail, and in order to help her guide, carried only the flag."),
+        .user("and you know we don't have insurance right so I mean how do we fill in the insurance agreement now"),
+        .assistant("We don't have insurance, right? How do we fill in the insurance agreement now?"),
+        .user("so yeah the marketing team said that like you can just basically use this template and then like select the distribution list once you send it out"),
+        .assistant("The marketing team said that you can just use this template and then select the distribution list once you send it out."),
+        .user("and he's now like not super responsive so like I don't know the status of the documents you know"),
+        .assistant("He's now not super responsive. I don't know the status of the documents."),
+        .user("then I gave him a call again and asked hey didn't we agree that Tesla will do it he said oh yeah yeah Tesla will do it which was a bit surprising"),
+        .assistant("Then I gave him a call again and asked, \"Hey, didn't we agree that Tesla will do it?\" He said, \"Oh yeah, yeah, Tesla will do it,\" which was a bit surprising."),
+        .user("did you see the report Doesn't it look like the numbers are off"),
+        .assistant("Did you see the report? Doesn't it look like the numbers are off?"),
+        .user("It can log into websites and click around like a person, and honestly I like that approach."),
+        .assistant("It can log into websites and click around like a person, and honestly I like that approach."),
+        .user("The result was very very good, exactly what we wanted, and the studio by the botanical gardens kept the term velorum."),
+        .assistant("The result was very very good, exactly what we wanted, and the studio by the botanical gardens kept the term velorum."),
         .user("Listen then, Amara, to a story of Rowan, who told it to Elias."),
         .assistant("Listen then, Amara, to a story of Rowan, who told it to Elias."),
-        .user("In a few hours the review would begin, and she was still choosing between waiting and publishing the report."),
-        .assistant("In a few hours the review would begin, and she was still choosing between waiting and publishing the report."),
-        .user("Robin Fairbrook saw that his doubts had been unfair, and he became ashamed of himself."),
-        .assistant("Robin Fairbrook saw that his doubts had been unfair, and he became ashamed of himself."),
+        .user("Surface dust at least had been removed and the ideas also remain while the practice was very generally accepted."),
+        .assistant("Surface dust, at least, had been removed, and the ideas also remain, while the practice was very generally accepted."),
         .user("So saying, she meanwhile crossed the square. There"),
         .assistant("So saying, she, meanwhile, crossed the square. There"),
-        .user("Listen then, Amara, and walk with Robin Fairbrook to the square. There"),
-        .assistant("Listen then, Amara, and walk with Robin Fairbrook to the square. There"),
         .user("All I say is kings is kings and you got to make allowances."),
         .assistant("All I say is, kings is kings, and you got to make allowances."),
-        .user("The report report has been has been ready since since Monday."),
-        .assistant("The report has been ready since Monday."),
     ]
 
-    static let recoveryHistory: [Chat.Message] = [
+    static let recoveryHistory: [Chat.Message] = PromptOverride.examples("WORDMATE_RECOVERY_EXAMPLES_FILE") ?? [
         .user("The result was very very good, exactly what we wanted."),
         .assistant("The result was very very good, exactly what we wanted."),
-        .user("Northstar Northstar is a scheduling tool tool for retail teams."),
+        .user("Northstar Northstar is like a scheduling tool tool for retail teams you know."),
         .assistant("Northstar is a scheduling tool for retail teams."),
         .user("I think I think we should update this function before before merging."),
         .assistant("I think we should update this function before merging."),
@@ -764,21 +859,19 @@ enum TranscriptPolishPolicy {
     ]
 
     static func prompt(for transcript: String) -> String {
+        if let template = PromptOverride.text("WORDMATE_POLISH_PROMPT_FILE") {
+            return template.replacingOccurrences(of: "{{TRANSCRIPT}}", with: transcript)
+        }
         return """
-        Losslessly polish the transcript below. Keep every source word unless it is visibly an exact adjacent
-        accidental repetition, a standalone filler, an explicit correction, or a partial-word retry. Do not infer
-        deletions from meaning or grammar. Never delete fluent content to make the sentence shorter or smoother.
-        If none of those visible cases occurs, change only punctuation and capitalization. When uncertain,
-        preserve the text.
-        A repeated span is not automatically accidental. Preserve deliberate emphasis such as "very very good".
-        Clean a clear speech restart such as "I think I think we should" to "I think we should". Scan the entire
-        transcript and remove every unmistakably accidental echo, not only the first. Never separate copies of an
-        accidental echo with punctuation or introduce a sentence boundary where the removed copy stood.
-        Keep all retained words in their original order; do not rewrite wording or guess recognition errors.
-        Keep enumerations as prose and do not create lists.
-        Do not omit any sentence or fragment, including unfamiliar or placeholder text. Return only the complete
-        polished transcript. Before returning, compare the result word by word with the source and restore every
-        source word that is not part of one of the visible deletion cases above.
+        Edit the dictated transcript below into clean written text. Remove filler words, stutters, echoes,
+        partial words, false starts and spoken self-corrections, and drop connectives that only chain spoken
+        sentences together. Fillers to remove: hedging "like", "you know", "I mean", "yeah", "basically",
+        "kind of", "sort of", "right", and "so", "and", "but", "because" when they only open a spoken
+        sentence. Keep every other word exactly as recognized and in order: do not rewrite,
+        summarize, add words or guess recognition errors. Split it into proper sentences with punctuation and
+        capitalization, put quotation marks around quoted speech, and keep numbers as recognized. Keep
+        deliberate repetition and an unfinished final fragment. Return only the complete edited text as plain
+        prose, without lists or commentary.
 
         ----- BEGIN SPOKEN TRANSCRIPT -----
         \(transcript)
@@ -794,20 +887,25 @@ enum TranscriptPolishPolicy {
         let before = precedingContext.isEmpty ? "None" : precedingContext
         let after = followingContext.isEmpty ? "None" : followingContext
 
+        if let template = PromptOverride.text("WORDMATE_STREAMING_PROMPT_FILE") {
+            return template
+                .replacingOccurrences(of: "{{BEFORE}}", with: before)
+                .replacingOccurrences(of: "{{TARGET}}", with: transcript)
+                .replacingOccurrences(of: "{{AFTER}}", with: after)
+        }
+
         return """
-        Polish only the target segment below. The surrounding passages are context only: use them to
-        understand sentence boundaries and self-corrections, but never include their words in your answer.
-        Keep every target word unless it is visibly an exact adjacent accidental repetition, a standalone filler,
-        an explicit correction, or a partial-word retry. Do not infer deletions from meaning or grammar. Never
-        delete fluent content to make it shorter or smoother. If none of those visible cases occurs, change only
-        punctuation and capitalization. Keep retained words in their original order; do not rewrite wording or
-        guess recognition errors. A repeated span is not automatically accidental: preserve deliberate emphasis
-        such as "very very good", but clean a clear restart such as "I think I think we should" to "I think we
-        should". Scan the entire target and remove every unmistakably accidental echo, not only the first. Never
-        separate copies with punctuation or introduce a sentence boundary where the removed copy stood.
-        Preserve an incomplete final fragment. Return only the complete polished target
-        segment as plain text. Before returning, compare it word by word with the target and restore every target
-        word that is not part of one of the visible deletion cases above.
+        Edit only the target segment below into clean written text. The surrounding passages are context
+        only: use them to see where sentences begin and end and what the speaker corrected, but never include
+        their words in your answer.
+        Remove filler words, stutters, echoes, partial words, false starts and spoken self-corrections from
+        the target, and drop a connective that only chains it to the previous spoken sentence. Fillers to
+        remove: hedging "like", "you know", "I mean", "yeah", "basically", "kind of", "sort of", "right",
+        and "so", "and", "but", "because" when they only open a spoken sentence. Keep every other target
+        word exactly as recognized and in order: do not rewrite, summarize, add words or guess recognition
+        errors. Punctuate and capitalize it as it should read inside the full text, with
+        quotation marks around quoted speech, and keep numbers as recognized. Keep deliberate repetition and
+        an unfinished final fragment. Return only the complete edited target segment as plain text.
 
         PRECEDING CONTEXT — DO NOT RETURN
         \(before)
@@ -818,6 +916,83 @@ enum TranscriptPolishPolicy {
         FOLLOWING CONTEXT — DO NOT RETURN
         \(after)
         """
+    }
+
+    // MARK: Paragraphs
+
+    static let paragraphInstructions = PromptOverride.text("WORDMATE_PARAGRAPH_INSTRUCTIONS_FILE") ?? """
+        You decide where paragraph breaks belong in a dictated text, as in a well-written email or note. The
+        text is given as numbered sentences. A new paragraph starts only where the speaker moves on to a
+        clearly new point, topic, step, time or addressee. Paragraphs hold three to six sentences, so most
+        texts need one to three breaks and short texts need none.
+        Reply with only the numbers of the sentences that start a new paragraph, separated by commas, in
+        increasing order, for example "4, 8". Reply "none" when the text should stay one paragraph.
+        """
+
+    static let paragraphHistory: [Chat.Message] = PromptOverride.examples("WORDMATE_PARAGRAPH_EXAMPLES_FILE") ?? [
+        .user("[1] Hi Dana, quick update on the launch. [2] The website copy is final and legal signed off yesterday. [3] The pricing page still needs the new tiers, which Sam is adding today. [4] On the event side, we have 40 confirmed attendees and the venue is booked until 9 pm. [5] Catering is confirmed for 50. [6] One open question is whether we record the talks. [7] I'd rather not, because two speakers asked for it to stay internal. [8] Let me know if you disagree. [9] Thanks, Robin."),
+        .assistant("4, 6, 9"),
+        .user("[1] The parser rejects any header longer than 512 bytes. [2] That limit comes from the original spec and most clients stay well below it. [3] We could raise it, but the proxy in front of us has the same limit. [4] So raising ours alone would not change anything."),
+        .assistant("none"),
+    ]
+
+    /// Minimum size before a paragraph pass is worth a model call.
+    static let minimumParagraphSentences = 8
+    static let minimumParagraphWords = 120
+    static let minimumSentencesPerParagraph = 3
+    /// Paragraphs are placed from the speaker's pauses (`ParagraphPlanner`).
+    /// Asking the model instead is an experiment that small models failed.
+    static let modelParagraphsEnabled = ProcessInfo.processInfo.environment["WORDMATE_MODEL_PARAGRAPHS"] == "1"
+
+    static func wantsParagraphs(sentences: [String]) -> Bool {
+        guard sentences.count >= minimumParagraphSentences else { return false }
+        let words = sentences.reduce(0) { $0 + $1.split(whereSeparator: \.isWhitespace).count }
+        return words >= minimumParagraphWords
+    }
+
+    static func paragraphPrompt(sentences: [String]) -> String {
+        sentences.enumerated()
+            .map { "[\($0.offset + 1)] \($0.element)" }
+            .joined(separator: " ")
+    }
+
+    /// Parses "3, 7" (or "[3] [7]", "3 and 7", "none") into zero-based sentence
+    /// indices, keeping paragraphs at least two sentences long.
+    static func paragraphStarts(from output: String, sentenceCount: Int) -> [Int] {
+        let cleaned = cleanModelOutput(output)
+        guard let regex = try? NSRegularExpression(pattern: #"\d+"#) else { return [] }
+        let numbers = regex.matches(in: cleaned, range: NSRange(cleaned.startIndex..., in: cleaned))
+            .compactMap { Range($0.range, in: cleaned) }
+            .compactMap { Int(cleaned[$0]) }
+        // A model that lists most sentences has not understood the task.
+        let distinct = Set(numbers)
+        guard !distinct.isEmpty, distinct.count <= max(3, sentenceCount / 3) else { return [] }
+        var starts: [Int] = []
+        var previousStart = 0
+        for number in distinct.sorted() {
+            let index = number - 1
+            guard index >= minimumSentencesPerParagraph,
+                  index < sentenceCount,
+                  index - previousStart >= minimumSentencesPerParagraph,
+                  sentenceCount - index >= 2 else { continue }
+            starts.append(index)
+            previousStart = index
+        }
+        return starts
+    }
+
+    static func applyingParagraphBreaks(to transcript: String, startingAt starts: [Int]) -> String {
+        guard !starts.isEmpty else { return transcript }
+        let sentences = StreamingTranscriptPolicy.sentenceSegments(in: transcript)
+        let startSet = Set(starts)
+        var result = ""
+        for (index, sentence) in sentences.enumerated() {
+            if index > 0 {
+                result += startSet.contains(index) ? "\n\n" : " "
+            }
+            result += sentence
+        }
+        return result
     }
 
     static func maximumOutputTokens(for transcript: String) -> Int {
@@ -1122,6 +1297,7 @@ enum TranscriptPolishPolicy {
         for source: String
     ) -> Bool {
         guard passesBasicSafety(candidate, for: source),
+              preservesNumericFacts(from: source, in: candidate),
               !introducesPresentationMarkup(candidate, absentFrom: source) else {
             return false
         }
@@ -1257,7 +1433,10 @@ enum TranscriptPolishPolicy {
             removingInsertedSentenceBreaks(from: projected, for: source)
         )
 
-        guard isConservativeEditAcceptable(projected, for: source) else {
+        // Substituted words were restored above, so a missing numeral here
+        // means the model dropped it rather than spelled it out.
+        guard preservesNumericFacts(from: source, in: projected),
+              isConservativeEditAcceptable(projected, for: source) else {
             return nil
         }
         return projected
@@ -1292,6 +1471,81 @@ enum TranscriptPolishPolicy {
         let sourceCoverage = Double(orderedOverlap)
             / Double(sourceWords.count)
         return candidateCoverage >= 0.80 && sourceCoverage >= 0.55
+    }
+
+    /// Small models often answer with the target plus the sentence that
+    /// follows it, or start by repeating the end of the preceding context.
+    /// When the copied halo sits cleanly at either edge, cut it off instead of
+    /// rejecting an otherwise good edit.
+    static func trimmingLeakedContext(
+        from candidate: String,
+        precedingContext: String,
+        followingContext: String
+    ) -> String {
+        var result = trimmingToTarget(candidate, source: nil)
+        let followingWords = words(in: followingContext)
+        let followingFingerprint = Array(followingWords.prefix(min(8, followingWords.count)))
+        if followingFingerprint.count >= 4 {
+            let tokens = wordTokens(in: result)
+            let normalized = tokens.map(\.normalized)
+            if normalized.count > followingFingerprint.count,
+               let start = normalized.indices.reversed().first(where: { index in
+                   normalized[index...].starts(with: followingFingerprint)
+               }),
+               start >= 2 {
+                result = String(result[..<tokens[start].range.lowerBound])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        let precedingWords = words(in: precedingContext)
+        let precedingFingerprint = Array(precedingWords.suffix(min(8, precedingWords.count)))
+        if precedingFingerprint.count >= 4 {
+            let tokens = wordTokens(in: result)
+            let normalized = tokens.map(\.normalized)
+            if normalized.count > precedingFingerprint.count,
+               normalized.starts(with: precedingFingerprint) {
+                let cut = tokens[precedingFingerprint.count].range.lowerBound
+                result = String(result[cut...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return result
+    }
+
+    /// When the answer is much longer than the target and the target's first
+    /// words appear well inside it, the model prefixed context; when the
+    /// target's last words appear well before the end, it appended context.
+    static func trimmingToTarget(_ candidate: String, source: String?) -> String {
+        guard let source else { return candidate }
+        let sourceWords = words(in: source)
+        guard sourceWords.count >= 4 else { return candidate }
+        var result = candidate
+        var tokens = wordTokens(in: result)
+        var normalized = tokens.map(\.normalized)
+        guard normalized.count > sourceWords.count + 3 else { return candidate }
+
+        let head = Array(sourceWords.prefix(4))
+        if let start = normalized.indices.first(where: { normalized[$0...].starts(with: head) }),
+           start >= 3 {
+            result = String(result[tokens[start].range.lowerBound...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            tokens = wordTokens(in: result)
+            normalized = tokens.map(\.normalized)
+        }
+        let tail = Array(sourceWords.suffix(4))
+        if normalized.count > sourceWords.count + 3,
+           let end = normalized.indices.reversed().first(where: { index in
+               index + tail.count <= normalized.count && normalized[index..<(index + tail.count)].elementsEqual(tail)
+           }),
+           normalized.count - (end + tail.count) >= 3 {
+            let cut = tokens[end + tail.count - 1].range.upperBound
+            var trimmed = String(result[..<cut])
+            // Keep the terminator that followed the last target word.
+            if cut < result.endIndex, StreamingTranscriptPolicy.isStrongTerminator(result[cut]) {
+                trimmed.append(result[cut])
+            }
+            result = trimmed.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return result
     }
 
     static func leaksStreamingContext(
@@ -1339,7 +1593,6 @@ enum TranscriptPolishPolicy {
     ) -> Bool {
         guard !candidate.isEmpty,
               !containsStructuredWrapper(candidate),
-              preservesNumericFacts(from: source, in: candidate),
               candidate.count <= source.count * 2 + 120 else {
             return false
         }
@@ -1368,10 +1621,12 @@ enum TranscriptPolishPolicy {
         return result
     }
 
-    /// Removes a sentence terminator the model placed after a word that does
+    /// Handles a sentence terminator the model placed after a word that does
     /// not end a sentence in the source when the following word is lowercase.
-    /// A 0.6B model sometimes replaces a deleted echo with a period, producing
-    /// "dummy text. of the printing" from "dummy text text of the printing".
+    /// Between two adjacent source words that is a genuine sentence split the
+    /// model forgot to capitalize, so the next word is capitalized. Next to a
+    /// deletion it is a period standing in for removed speech ("dummy text.
+    /// of the printing" from "dummy text text of the printing") and is removed.
     static func removingInsertedSentenceBreaks(
         from candidate: String,
         for source: String
@@ -1381,16 +1636,22 @@ enum TranscriptPolishPolicy {
         guard !sourceTokens.isEmpty, !candidateTokens.isEmpty else { return candidate }
 
         var matchedSourceIndex: [Int: Int] = [:]
+        var matchedSourceIndices = Set<Int>()
         for step in wordAlignment(
             source: sourceTokens.map(\.normalized),
             candidate: candidateTokens.map(\.normalized)
         ) {
             if case let .match(sourceIndex, candidateIndex) = step {
                 matchedSourceIndex[candidateIndex] = sourceIndex
+                matchedSourceIndices.insert(sourceIndex)
             }
         }
 
-        var removals: [String.Index] = []
+        enum Fix {
+            case remove(String.Index)
+            case capitalize(String.Index)
+        }
+        var fixes: [(position: String.Index, fix: Fix)] = []
         for (candidateIndex, token) in candidateTokens.enumerated() {
             let terminatorIndex = token.range.upperBound
             guard terminatorIndex < candidate.endIndex,
@@ -1404,19 +1665,37 @@ enum TranscriptPolishPolicy {
             }
             guard cursor < candidate.endIndex, candidate[cursor].isLowercase else { continue }
 
-            if let sourceIndex = matchedSourceIndex[candidateIndex],
-               StreamingTranscriptPolicy.hasStrongBoundary(
-                   after: sourceTokens[sourceIndex].range.upperBound,
-                   in: source
-               ) {
+            guard let sourceIndex = matchedSourceIndex[candidateIndex] else {
+                fixes.append((terminatorIndex, .remove(terminatorIndex)))
                 continue
             }
-            removals.append(terminatorIndex)
+            if StreamingTranscriptPolicy.hasStrongBoundary(
+                after: sourceTokens[sourceIndex].range.upperBound,
+                in: source
+            ) {
+                continue
+            }
+            let previousDeleted = sourceIndex > 0 && !matchedSourceIndices.contains(sourceIndex - 1)
+            let nextDeleted = sourceIndex + 1 < sourceTokens.count
+                && !matchedSourceIndices.contains(sourceIndex + 1)
+            if !previousDeleted, !nextDeleted,
+               let nextSourceIndex = matchedSourceIndex[candidateIndex + 1],
+               nextSourceIndex == sourceIndex + 1 {
+                fixes.append((cursor, .capitalize(cursor)))
+            } else {
+                fixes.append((terminatorIndex, .remove(terminatorIndex)))
+            }
         }
 
         var result = candidate
-        for index in removals.reversed() {
-            result.remove(at: index)
+        for entry in fixes.sorted(by: { $0.position > $1.position }) {
+            switch entry.fix {
+            case let .remove(index):
+                result.remove(at: index)
+            case let .capitalize(index):
+                let uppercased = String(result[index]).uppercased()
+                result.replaceSubrange(index...index, with: uppercased)
+            }
         }
         return result
     }
@@ -1610,6 +1889,87 @@ enum TranscriptPolishPolicy {
     /// copies of immediately repeated speech, partial-word retries, and, once
     /// repeated speech proves the passage is disfluent, a small number of
     /// nearby false starts the model identified.
+    /// Words a speaker uses to keep talking rather than to say something. The
+    /// model may delete them (up to a share of the segment) without drawing on
+    /// the small budget reserved for false starts and self-corrections.
+    static let fillerWords: Set<String> = [
+        "um", "umm", "uh", "uhh", "hmm", "mm", "mhm", "ah", "oh", "er", "erm",
+        "like", "yeah", "yes", "basically", "actually",
+        "right", "okay", "ok", "well", "anyway", "literally", "honestly", "obviously", "essentially",
+    ]
+
+    /// Connectives that only chain spoken sentences ("…on the 28th, and he
+    /// mentioned…"). They are fillers only before a pronoun-like
+    /// continuation; "Mr. and Mrs." or "bread and butter" are content.
+    static let connectiveWords: Set<String> = ["and", "but", "or", "so", "because", "then"]
+    static let connectiveContinuations: Set<String> = [
+        "i", "we", "you", "he", "she", "they", "it", "this", "that", "there", "then", "now", "so",
+        "like", "yeah", "um", "uh", "also", "just", "basically", "actually", "what", "when", "where",
+        "how", "why", "if", "my", "our", "your", "his", "her", "their", "its",
+    ]
+
+    /// Word tokens split at apostrophes, so "I don't know" is ["i", "don", "t", "know"].
+    static let fillerPhrases: [[String]] = [
+        ["you", "know"], ["i", "mean"], ["kind", "of"], ["sort", "of"], ["i", "guess"],
+        ["you", "see"], ["or", "so"], ["or", "something"], ["or", "whatever"],
+        ["and", "stuff"], ["and", "so", "on"], ["i", "don", "t", "know"], ["it", "s", "like"],
+        ["blah", "blah", "blah"],
+    ]
+
+    /// Words that begin a clause after a false start ("I think we | but with
+    /// this prompt"). Case-insensitive; a capitalized word also qualifies.
+    static let clauseStarters: Set<String> = [
+        "i", "we", "you", "he", "she", "they", "it", "this", "that", "there", "these", "those",
+        "what", "when", "where", "why", "how", "who", "which", "and", "but", "so", "because",
+        "then", "or", "if", "let", "my", "our", "your", "now", "okay", "well",
+    ]
+
+    /// Words that mark a spoken self-correction inside a deleted run.
+    static let correctionCues: Set<String> = [
+        "sorry", "mean", "no", "actually", "rather", "correction", "scratch", "wait",
+    ]
+
+    /// Counts deleted words that are fillers or parts of filler phrases.
+    private static func fillerDeletionCount(_ deletedIndices: Set<Int>, in tokens: [WordToken]) -> Int {
+        let words = tokens.map(\.normalized)
+        let sorted = deletedIndices.sorted().filter { $0 < words.count }
+        var count = 0
+        var runStart = 0
+        while runStart < sorted.count {
+            var runEnd = runStart
+            while runEnd + 1 < sorted.count, sorted[runEnd + 1] == sorted[runEnd] + 1 {
+                runEnd += 1
+            }
+            var position = sorted[runStart]
+            let end = sorted[runEnd]
+            while position <= end {
+                var matchedPhrase = 0
+                for phrase in fillerPhrases where position + phrase.count - 1 <= end {
+                    if words[position..<(position + phrase.count)].elementsEqual(phrase) {
+                        matchedPhrase = phrase.count
+                        break
+                    }
+                }
+                if matchedPhrase > 0 {
+                    count += matchedPhrase
+                    position += matchedPhrase
+                    continue
+                }
+                if fillerWords.contains(words[position]) {
+                    count += 1
+                } else if connectiveWords.contains(words[position]),
+                          position + 1 < tokens.count,
+                          connectiveContinuations.contains(words[position + 1]),
+                          words[position + 1] == "i" || tokens[position + 1].original.first?.isUppercase != true {
+                    count += 1
+                }
+                position += 1
+            }
+            runStart = runEnd + 1
+        }
+        return count
+    }
+
     private static func deletionsAreWithinBudget(
         _ deletedIndices: Set<Int>,
         in tokens: [WordToken],
@@ -1621,27 +1981,135 @@ enum TranscriptPolishPolicy {
             return false
         }
 
+        // Fillers may go freely, but never most of a segment: a model that
+        // "cleans" half the words has stopped editing and started summarizing.
+        let fillerAllowance = min(
+            fillerDeletionCount(deletedIndices, in: tokens),
+            max(4, words.count * 2 / 5)
+        )
         let repeatedSpeechAllowance = repeatedSpeechWordCount(in: words)
         let partialWordRetryAllowance = partialWordRetryDeletionCount(
             deletedIndices,
             in: tokens,
             source: source
         )
+        // A false start is a run of words the speaker abandoned. A single
+        // content word on its own ("would", "very", "the") is never a false
+        // start; dropping it is paraphrase, however fluent the result reads.
+        guard !deletesLoneContentWords(deletedIndices, in: tokens, source: source) else {
+            return false
+        }
+        // False starts, restarts and spoken corrections are short. This budget
+        // is deliberately small so optional fluent words cannot be dropped at
+        // scale, while a "the model I think we but with this" abandonment can.
         let otherDisfluencyAllowance: Int
         switch budget {
         case .conservative:
-            otherDisfluencyAllowance = repeatedSpeechAllowance > 0
-                ? max(4, words.count / 16)
-                : 0
+            otherDisfluencyAllowance = max(3, words.count / 8)
         case .recovery:
-            otherDisfluencyAllowance = repeatedSpeechAllowance > 0
-                ? max(2, words.count / 20)
-                : 0
+            otherDisfluencyAllowance = max(2, words.count / 12)
         }
         return deletedIndices.count
-            <= repeatedSpeechAllowance
+            <= fillerAllowance
+            + repeatedSpeechAllowance
             + partialWordRetryAllowance
             + otherDisfluencyAllowance
+    }
+
+    /// Whether any deleted run consists of exactly one word that is neither a
+    /// filler, part of a filler phrase, a copy of immediately repeated speech,
+    /// nor a partial-word retry.
+    private static func deletesLoneContentWords(
+        _ deletedIndices: Set<Int>,
+        in tokens: [WordToken],
+        source: String
+    ) -> Bool {
+        let words = tokens.map(\.normalized)
+        var protected = Set<Int>()
+        for copies in immediateRepeatedSpeechCopies(in: words) {
+            protected.formUnion(copies.first)
+            protected.formUnion(copies.second)
+        }
+        // A deleted word that repeats the nearest retained word on either side
+        // is a restart interrupted by a filler ("before, um, before").
+        for index in deletedIndices where index < words.count {
+            var next = index + 1
+            while next < words.count, deletedIndices.contains(next) { next += 1 }
+            var previous = index - 1
+            while previous >= 0, deletedIndices.contains(previous) { previous -= 1 }
+            if (next < words.count && words[next] == words[index])
+                || (previous >= 0 && words[previous] == words[index]) {
+                protected.insert(index)
+            }
+        }
+        let sorted = deletedIndices.sorted().filter { $0 < words.count }
+        var runStart = 0
+        while runStart < sorted.count {
+            var runEnd = runStart
+            while runEnd + 1 < sorted.count, sorted[runEnd + 1] == sorted[runEnd] + 1 {
+                runEnd += 1
+            }
+            let run = Set(sorted[runStart...runEnd])
+            let fillers = fillerDeletionCount(run, in: tokens)
+            let retries = partialWordRetryDeletionCount(run, in: tokens, source: source)
+            let echoes = run.filter { protected.contains($0) }.count
+            let contentWords = run.count - min(run.count, fillers + retries + echoes)
+            if contentWords == 1, run.count - fillers == 1 {
+                return true
+            }
+            let first = sorted[runStart]
+            let last = sorted[runEnd]
+            if contentWords > 0 {
+                // A false start is abandoned speech that the speaker restarts,
+                // so the words after it begin a clause. A run followed by the
+                // end of the text or by an ordinary continuation ("by Cicero
+                // written in", "the program at the time.") is content.
+                let next = last + 1
+                guard next < tokens.count else { return true }
+                let nextWord = words[next]
+                let nextCapitalized = tokens[next].original.first?.isUppercase == true
+                guard clauseStarters.contains(nextWord) || nextCapitalized else { return true }
+                // And it begins like speech that was restarted: with a
+                // pronoun, a filler, or a fresh sentence, never with "to it"
+                // or "by Cicero" lifted out of a fluent phrase.
+                let firstWord = words[first]
+                let firstCapitalized = tokens[first].original.first?.isUppercase == true
+                guard clauseStarters.contains(firstWord) || fillerWords.contains(firstWord)
+                    || connectiveWords.contains(firstWord) || firstCapitalized else { return true }
+                // Names are never false starts. A capitalized word inside the
+                // run that does not start a sentence is a name or a term,
+                // unless the speaker corrected it ("Thursday, sorry, Friday").
+                let isCorrection = run.contains { correctionCues.contains(words[$0]) }
+                for index in sorted[runStart...runEnd]
+                where index > 0 && !protected.contains(index) && !isCorrection {
+                    let token = tokens[index]
+                    guard token.original.first?.isUppercase == true,
+                          token.normalized != "i",
+                          !fillerWords.contains(token.normalized) else { continue }
+                    let startsSentence = StreamingTranscriptPolicy.hasStrongBoundary(
+                        after: tokens[index - 1].range.upperBound,
+                        in: source
+                    )
+                    if !startsSentence { return true }
+                }
+            }
+            // A whole sentence is never a false start: a run that begins at a
+            // sentence start and ends at a strong boundary drops content.
+            let startsSentence = first == 0
+                || StreamingTranscriptPolicy.hasStrongBoundary(
+                    after: tokens[first - 1].range.upperBound,
+                    in: source
+                )
+            let endsSentence = StreamingTranscriptPolicy.hasStrongBoundary(
+                after: tokens[last].range.upperBound,
+                in: source
+            )
+            if contentWords > 0, startsSentence, endsSentence {
+                return true
+            }
+            runStart = runEnd + 1
+        }
+        return false
     }
 
     /// Counts deleted words that are a strict prefix of the next retained word,
@@ -1749,13 +2217,13 @@ enum TranscriptPolishPolicy {
         }
     }
 
+    /// Every distinct numeral in the source must survive and the candidate may
+    /// not introduce new ones. Counting occurrences instead would reject the
+    /// removal of a stuttered "24 24 hours".
     private static func preservesNumericFacts(from source: String, in candidate: String) -> Bool {
-        var remaining = numericFacts(in: candidate)
-        for fact in numericFacts(in: source) {
-            guard let index = remaining.firstIndex(of: fact) else { return false }
-            remaining.remove(at: index)
-        }
-        return true
+        // New numerals (a numbered list the model wrote out) are judged by the
+        // word-level projection, not here.
+        Set(numericFacts(in: source)).isSubset(of: Set(numericFacts(in: candidate)))
     }
 
     private static func numericFacts(in text: String) -> [String] {

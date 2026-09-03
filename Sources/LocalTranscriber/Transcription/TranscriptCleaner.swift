@@ -13,6 +13,10 @@ enum TranscriptCleaner {
         text = replacing(#"\s*[,;:]\s*"# + filler + #"(?=\s*(?:[.!?]|$))"#, in: text, with: "")
         text = replacing(filler, in: text, with: " ")
 
+        // Hedging "like" and parenthetical "you know" are identifiable from
+        // their neighbours; small models leave most of them in otherwise.
+        text = DiscourseFillerCleaner.removingFillers(from: text)
+
         // Drop unmistakable partial-word retries such as "s simply" so a
         // stray letter or word fragment never reaches the pasted text.
         text = PartialWordRetryCleaner.removingRetries(from: text)
@@ -22,6 +26,7 @@ enum TranscriptCleaner {
         text = replacing(#"\s+([,.;:!?])"#, in: text, with: "$1")
         text = replacing(#"([,;:])(?:\s*[,;:])+"#, in: text, with: "$1")
         text = replacing(#"[,;:]\s*([.!?])"#, in: text, with: "$1")
+        text = replacing(#"([.!?])\s*[,;:]\s*"#, in: text, with: "$1 ")
         text = replacing(#"^\s*[,;:]\s*"#, in: text, with: "")
 
         let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)

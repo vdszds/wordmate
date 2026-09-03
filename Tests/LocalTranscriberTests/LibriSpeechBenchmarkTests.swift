@@ -465,7 +465,9 @@ final class LibriSpeechBenchmarkTests: XCTestCase {
     }
 
     private func normalizedWords(_ text: String) -> [String] {
-        text.lowercased().split { character in
+        // The production pipeline writes spelled-out numbers as numerals;
+        // LibriSpeech references spell them out. Score content, not notation.
+        SpokenNumberFormatter.format(text).lowercased().split { character in
             !character.isLetter && !character.isNumber
         }.map(String.init)
     }

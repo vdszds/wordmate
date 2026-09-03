@@ -299,7 +299,7 @@ actor StreamingTranscriptPolisher {
 
         return LiveDictationResult(
             rawTranscript: rawTranscript,
-            transcript: candidate,
+            transcript: await finished(candidate),
             finalizationDiagnostics: StreamingFinalizationDiagnostics(
                 strategy: .anchoredRanges,
                 fullPassReason: nil,
@@ -410,7 +410,9 @@ actor StreamingTranscriptPolisher {
     ) async -> LiveDictationResult {
         LiveDictationResult(
             rawTranscript: rawTranscript,
-            transcript: await polishWholeTranscriptOrUseRaw(rawTranscript),
+            transcript: await finished(
+                await polishWholeTranscriptOrUseRaw(rawTranscript)
+            ),
             finalizationDiagnostics: StreamingFinalizationDiagnostics(
                 strategy: .wholeTranscript,
                 fullPassReason: reason,
@@ -423,6 +425,20 @@ actor StreamingTranscriptPolisher {
                 reprocessedRangeCount: rawTranscript.isEmpty ? 0 : 1
             )
         )
+    }
+
+    /// Final presentation of an accepted transcript: numerals for spelled-out
+    /// numbers, then paragraph breaks chosen by the model at sentence
+    /// boundaries. Neither step can change a word.
+    private func finished(_ transcript: String) async -> String {
+        let formatted = SpokenNumberFormatter.format(transcript)
+        let starts: [Int]
+        if TranscriptPolishPolicy.modelParagraphsEnabled {
+            starts = (try? await processor.paragraphStarts(in: formatted, using: model)) ?? []
+        } else {
+            starts = ParagraphPlanner.paragraphStarts(in: formatted)
+        }
+        return TranscriptPolishPolicy.applyingParagraphBreaks(to: formatted, startingAt: starts)
     }
 
     private func polishWholeTranscriptOrUseRaw(_ transcript: String) async -> String {

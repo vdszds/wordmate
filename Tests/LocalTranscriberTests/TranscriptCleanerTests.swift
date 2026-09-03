@@ -67,4 +67,36 @@ final class TranscriptCleanerTests: XCTestCase {
             "The industry's standard re-read the co-op's notes."
         )
     }
+
+    func testHedgingLikeAndParentheticalYouKnowAreRemoved() {
+        XCTAssertEqual(
+            TranscriptCleaner.clean("He's now like not super responsive."),
+            "He's now not super responsive."
+        )
+        XCTAssertEqual(
+            TranscriptCleaner.clean("Like I call him and ask him, like what do we need to fill in?"),
+            "I call him and ask him, what do we need to fill in?"
+        )
+        XCTAssertEqual(
+            TranscriptCleaner.clean("I told him, like, ten times that we will be away."),
+            "I told him, ten times that we will be away."
+        )
+        XCTAssertEqual(
+            TranscriptCleaner.clean("and you know we don't have insurance, right?"),
+            "and we don't have insurance, right?"
+        )
+    }
+
+    func testComparisonsVerbsAndIdiomsKeepLikeAndYouKnow() {
+        let untouched = [
+            "It looks like a person, and I like that approach.",
+            "Something like that is fine, and like I said, it works.",
+            "Providers like AWS or Azure offer every service.",
+            "Do you know the answer? You know what I mean.",
+            "It was like this before, so treat it like the others.",
+        ]
+        for text in untouched {
+            XCTAssertEqual(TranscriptCleaner.clean(text), text)
+        }
+    }
 }

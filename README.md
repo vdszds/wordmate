@@ -2,7 +2,7 @@
 
 This repository contains the on-device transcription pipeline used by [Wordmate](https://wordmate.sh) for macOS.
 
-Parakeet turns microphone audio into text. Qwen can then clean up punctuation, capitalization, repeated words, and spoken corrections. On longer recordings, most of that cleanup happens while you are still speaking. On the test machine, the final text was ready about **0.3 seconds after Fn was released** for the median LibriSpeech recording, and within about **0.7–1.7 seconds** for one-minute dictations with stutters.
+Parakeet turns microphone audio into text. Qwen then turns that dictation into written text: punctuation, capitalization, filler words, stutters, false starts, and spoken corrections. Rules write spoken numbers as numerals and split long dictations into paragraphs. On longer recordings, most of the cleanup happens while you are still speaking. On the test machine, the final text was ready about **0.3 seconds after Fn was released** for the median LibriSpeech recording, and within about **0.7–1.7 seconds** for one-minute dictations with stutters.
 
 Everything runs locally. Audio and transcripts do not leave the Mac.
 
@@ -10,10 +10,10 @@ This repository does not contain the Wordmate interface, onboarding, keyboard ha
 
 ## Models
 
-| Step | Model | Runs with | What it does |
-| --- | --- | --- | --- |
-| Speech recognition | Parakeet TDT v3 | FluidAudio and Core ML | Turns 16 kHz mono audio into text |
-| Optional text cleanup | Qwen3 0.6B, 4-bit (about 351 MB) | MLX Swift and Metal | Cleans the transcript without freely rewriting it |
+| Step                  | Model                            | Runs with              | What it does                                                |
+| --------------------- | -------------------------------- | ---------------------- | ----------------------------------------------------------- |
+| Speech recognition    | Parakeet TDT v3                  | FluidAudio and Core ML | Turns 16 kHz mono audio into text                           |
+| Optional text cleanup | Qwen3 0.6B, 4-bit (about 351 MB) | MLX Swift and Metal    | Turns the transcript into written text without rewriting it |
 
 Both models are downloaded once and then loaded from the Mac. Qwen is optional. If it is disabled, Wordmate returns the raw Parakeet transcript after a small rule-based cleanup.
 
@@ -66,131 +66,121 @@ The sentence-boundary check matters: an early checkpoint can end in the middle o
 
 ## What Qwen does
 
-Qwen is used as a careful copy editor, not as a general-purpose writer.
+Qwen is prompted as an assistant that edits a voice note before it goes into an email or a document. It works on the words as recognized and never becomes a writer.
 
-| Qwen may | Qwen may not |
-| --- | --- |
-| Add punctuation and capitalization | Summarize or shorten the message |
-| Remove a clearly accidental repeated phrase | Guess a different name, term, or recognized word |
-| Remove a standalone filler | Reword a sentence to make it sound smoother |
-| Apply an explicit spoken correction | Add lists, Markdown, commentary, or answers |
-| Remove an obvious partial-word retry | Silently change a number |
+| Qwen may                                                                                      | Qwen may not                                                               |
+| --------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| Add periods, commas, question marks, capitalization, and quotation marks around quoted speech | Summarize, shorten, or reword a sentence                                   |
+| Remove filler words and verbal tics such as `um`, `like`, `you know`, `I mean`, `basically`   | Guess a different name, term, or recognized word                           |
+| Remove stutters, echoes, and partial words                                                    | Delete a name, a lone content word, a whole sentence, or a trailing phrase |
+| Remove a false start the speaker abandoned and then restarted                                 | Add lists, Markdown, commentary, or answers                                |
+| Apply an explicit spoken correction                                                           | Change a number                                                            |
+| Drop a connective that only chains spoken sentences together (`and`, `so`, `but`)             |                                                                            |
 
 For example:
 
 ```text
-I think I think we should update this function before before merging.
-→ I think we should update this function before merging.
+so um I'm just I'm just checking in to see if there are any updates on the order
+→ I'm just checking in to see if there are any updates on the order.
+
+I agree we should add examples I think we but with this prompt the model does almost nothing
+→ I agree we should add examples. But with this prompt, the model does almost nothing.
+
+did you see the report Doesn't it look like the numbers are off
+→ Did you see the report? Doesn't it look like the numbers are off?
 
 The result was very very good, exactly what we wanted.
 → The result was very very good, exactly what we wanted.
-
-The feature is ready it works well should we release it tomorrow
-→ The feature is ready. It works well. Should we release it tomorrow?
 ```
 
-The second example stays unchanged because repeated words can be intentional emphasis.
+The last example stays unchanged because repeated words can be intentional emphasis.
+
+Two rule-based steps finish the text after Qwen. [`SpokenNumberFormatter`](Sources/LocalTranscriber/Transcription/SpokenNumberFormatter.swift) writes spoken numbers the way a person types them: `twenty four hours` becomes `24 hours`, `the twenty eighth` becomes `the 28th`, `nineteen sixty six` becomes `1966`, `zero percent` becomes `0%`, `one point five` becomes `1.5`, and a number read digit by digit becomes a digit string. Small numbers such as `one week` or `six million` stay as words. [`ParagraphPlanner`](Sources/LocalTranscriber/Transcription/ParagraphPlanner.swift) splits dictations of at least eight sentences and 120 words into paragraphs of about three sentences, avoiding a break before a sentence that continues the previous one (`He …`, `Then …`). Neither step can change a word, which is why numbers are not left to the model.
 
 ### Safety checks after Qwen
 
 [`TranscriptPolishPolicy`](Sources/LocalTranscriber/Transcription/TranscriptPostProcessor.swift) checks Qwen's answer before it is accepted:
 
-- Kept words must come from the original transcript and stay in the same order.
-- Guessed or replaced words are changed back to the original words.
-- Qwen cannot delete words from fluent text just to make it shorter. Deletions are allowed only for complete copies of immediately repeated speech, for a partial-word retry (a word that is a strict prefix of the next word, such as `s simply`), and, once repeated speech shows the passage is disfluent, for a few nearby false starts.
+- Kept words must come from the original transcript and stay in the same order. Guessed or replaced words are changed back to the original words.
+- Deletions are budgeted by kind. Filler words and phrases may go freely, but never more than about 40% of a segment. Complete copies of immediately repeated speech and partial-word retries (a fragment that is a strict prefix of the next word, such as `s simply`) may go. A small budget of about one word in eight covers false starts and spoken corrections, and only for runs of two or more words that are followed by the start of a clause and contain no name.
+- A lone content word, a whole sentence, or a phrase at the end of the text can never be deleted, however fluent the shorter version reads.
 - If Qwen removes a repeated phrase, it must remove one complete copy.
-- Every number from the original transcript must remain unchanged.
-- Markdown emphasis around a word is stripped rather than rejected; JSON, XML, prompt instructions, or copied context are rejected.
-- A sentence break that Qwen inserts before a lowercase word where the original had none is removed.
+- Every number from the original transcript must remain.
+- A sentence break that Qwen inserts between two adjacent original words is kept and the next word is capitalized; a period standing where deleted speech was is removed.
+- Markdown emphasis around a word is stripped rather than rejected; JSON, XML, prompt instructions, or copied context are rejected. An answer that repeats the surrounding context around the segment is first trimmed to the segment.
 - If an answer is unsafe, Wordmate retries the same text without context, then one sentence at a time. A chunk that starts or ends mid-sentence can never gain a period at the seam, and a separate echo-removal prompt runs only when repeated speech is still present.
 
 Qwen runs with `temperature = 0`, `topP = 1`, no repetition penalty, and thinking disabled. A repetition penalty was measured and left off: the task is verbatim copying, and a penalty discourages re-emitting the repeated source words a faithful edit must keep. Every prompt starts with the same instructions and examples, so the key/value cache of that shared prefix is kept between calls and only the transcript-specific part of each prompt is processed.
 
-Before Qwen runs, a small rule-based cleaner removes standalone versions of `um` and `uh`, repairs the leftover spacing, and removes unmistakable partial-word retries. [`PartialWordRetryCleaner`](Sources/LocalTranscriber/Transcription/PartialWordRetryCleaner.swift) deletes a fragment only when it is a strict prefix of the next word, is not joined to it by an apostrophe or hyphen, and is not a word in the user's spelling language according to the macOS spell checker; in English, single letters other than `a` and `I` also count as fragments. Dictionary words such as `the` in `the theory` are never touched.
+Before Qwen runs, a small rule-based cleaner removes standalone versions of `um` and `uh`, removes the two fillers small models most often leave behind, repairs the leftover spacing, and removes unmistakable partial-word retries. [`DiscourseFillerCleaner`](Sources/LocalTranscriber/Transcription/DiscourseFillerCleaner.swift) deletes a hedging `like` (`he's now like not responsive`, `like I told him`) and a parenthetical `you know` when their neighbours identify them; comparisons (`like a person`), the verb (`I like`), the idiom `like I said`, and `you know the answer` stay. Measured against a human-edited reference, these two rules agree with the editor in about four of five cases, which the models did not reach on their own. [`PartialWordRetryCleaner`](Sources/LocalTranscriber/Transcription/PartialWordRetryCleaner.swift) deletes a fragment only when it is a strict prefix of the next word, is not joined to it by an apostrophe or hyphen, and is not a word in the user's spelling language according to the macOS spell checker; in English, single letters other than `a` and `I` also count as fragments. Dictionary words such as `the` in `the theory` are never touched.
 
 ## Performance
 
-The numbers below were produced on 2 September 2026 by the public benchmark tests. They use the same Parakeet, Qwen, early-cleanup, final-pass, and safety code as the production pipeline.
+The numbers below were produced on 3 September 2026 by the public benchmark tests. They use the same Parakeet, Qwen, cleanup, final-pass, and safety code as the production pipeline.
 
 ### Word error rate
 
-Word error rate, or WER, measures wrong, missing, and extra words. Lower is better. It ignores punctuation and capitalization.
+Word error rate, or WER, measures wrong, missing, and extra words. Lower is better. It ignores punctuation and capitalization, and numbers are compared as numerals on both sides, so `twenty four` in a reference and `24` in the output count as the same word.
 
-| LibriSpeech set | Recordings | Audio | Reference words | Parakeet WER | WER after Qwen | Recordings made better / unchanged / worse |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `test-clean` | 100 | 16.018 min | 2,527 | **1.979%** | **1.979%** | 0 / 100 / 0 |
-| `test-other` | 50 | 7.956 min | 1,330 | **3.759%** | **3.759%** | 0 / 50 / 0 |
+| LibriSpeech set | Recordings |      Audio | Reference words | Parakeet WER | WER after Qwen | Recordings made better / unchanged / worse |
+| --------------- | ---------: | ---------: | --------------: | -----------: | -------------: | -----------------------------------------: |
+| `test-clean`    |        100 | 16.018 min |           2,527 |   **2.018%** |     **2.018%** |                                0 / 100 / 0 |
+| `test-other`    |         50 |  7.956 min |           1,329 |   **3.762%** |     **3.762%** |                                 0 / 50 / 0 |
 
 Qwen receives text, not audio, so it does not have its own speech-recognition WER. “WER after Qwen” is the score for the final pipeline output.
 
-The unchanged scores are expected for these fluent audiobook recordings. Qwen can improve punctuation and capitalization, but WER does not count those changes. It is also deliberately prevented from guessing corrections to Parakeet's recognized words. Across all 150 recordings, Qwen added **zero word errors**.
+The unchanged scores are expected for these fluent audiobook recordings. Qwen can improve punctuation and capitalization, but WER does not count those changes. It is deliberately prevented from guessing corrections to Parakeet's recognized words, and the safety checks stop it from dropping content: across all 150 recordings, Qwen added **zero word errors**.
 
 ### Time after releasing Fn
 
 The next table measures what the user waits for after speaking. Model downloads and startup loading are not included. These runs use the release build, which is what the app ships.
 
-| LibriSpeech set | Parakeet result | Extra Qwen and final checks | Final text | 90% finished within | 95% finished within | Slowest result |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `test-clean` | 0.174 s median | 0.131 s median | **0.306 s median** | 0.367 s | 0.390 s | 0.427 s |
-| `test-other` | 0.175 s median | 0.129 s median | **0.300 s median** | 0.411 s | 0.429 s | 0.479 s |
+| LibriSpeech set | Parakeet result | Extra Qwen and final checks |         Final text | 90% finished within | 95% finished within | Slowest result |
+| --------------- | --------------: | --------------------------: | -----------------: | ------------------: | ------------------: | -------------: |
+| `test-clean`    |  0.148 s median |              0.133 s median | **0.285 s median** |             0.367 s |             0.411 s |        0.474 s |
+| `test-other`    |  0.143 s median |              0.129 s median | **0.277 s median** |             0.382 s |             0.440 s |        0.803 s |
 
-Each median is calculated separately, so the first two columns may not add up to the third exactly. Compared with the previous pipeline, the median time after release fell from 0.403 s to 0.306 s on `test-clean` and from 0.404 s to 0.300 s on `test-other`; the 95th percentile fell from 0.520 s to 0.390 s and from 0.567 s to 0.429 s.
+Each median is calculated separately, so the first two columns may not add up to the third exactly.
 
-### Longer dictations with stutters
+### Real dictation compared with an edited reference
 
-LibriSpeech is fluent read speech, so it shows that Qwen is lossless but not what it fixes. For that, four one-minute recordings of a speaker reading placeholder text were played through the pipeline in real time using [`StreamingAudioPipelineBenchmarkTests`](Tests/LocalTranscriberTests/StreamingAudioPipelineBenchmarkTests.swift). Two of them contain heavy stutters: repeated words, repeated phrases, and restarted words.
+WER cannot see sentence breaks, stray capitals, `like` and `you know`, numbers written as words, or absence of paragraphs. To measure those, ten dictations were played through the pipeline in real time and compared with the ideal transcript used as the edited reference.
 
-| Recording | Audio | Reference words | Parakeet word errors | Word errors after Qwen | Parakeet WER | WER after Qwen |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Lorem Ipsum 1 | 63.7 s | 117 | 13 | 13 | 11.111% | 11.111% |
-| Lorem Ipsum 2 (heavy stutter) | 71.3 s | 136 | 30 | 30 | 22.059% | 22.059% |
-| Lorem Ipsum 3 | 55.9 s | 148 | 9 | 9 | 6.081% | 6.081% |
-| Heavy stutter | 61.6 s | 73 | 23 | **12** | 31.507% | **16.438%** |
-| **All four** | 252.5 s | 474 | 75 | **64** | 15.823% | **13.502%** |
+The score is the character error rate of the _formatted_ text after whitespace normalization, so casing, punctuation, numerals, and paragraph breaks all count. [`DictationSetBenchmarkTests`](Tests/LocalTranscriberTests/DictationSetBenchmarkTests.swift) also reports a content WER on lowercased, punctuation-free words, sentence-boundary, comma, and paragraph F1, casing agreement, and how many of the reference's numerals appear in the output. The prompt, the safety checks, and the rule-based steps were tuned against this set, and three cleanup models were compared on the same captured Parakeet output:
 
-On the recording built around stutters, Qwen removed eleven of Parakeet's 23 word errors: `Lorem Ipsum Ipsum is simply dummy text text`, `has been has been`, `ever since ever since`, `took took`, `translation translation`, `dummy text dummy text`, and `survived survived` all came out clean. It missed two: `designers designers` received a comma instead of a deletion, and the restarted name in `Bridge Brid St Bride` stayed. The other three recordings did not move, for two different reasons. Lorem Ipsum 1 and 3 are almost fluent, and their remaining errors are Parakeet recognition mistakes on names and Latin (`Saint Bridge` for St Bride, `Letra sets` for Letraset's, `loran ipsum`) that Qwen is deliberately forbidden to guess at. Lorem Ipsum 2 stutters mostly on the Latin itself (`Lorum Ipsum Lorum Ipsum dolorum Lorum Ipsum dolor sit amed`), which a 0.6B model does not recognize as a restart, and the rest of its errors are again names, sound-alike words, and numbers spoken as words.
+| Cleanup model                                    | Formatted error rate | Content WER | Sentence F1 | Fn release → final text, four recordings above |
+| ------------------------------------------------ | -------------------: | ----------: | ----------: | ---------------------------------------------- |
+| None (raw Parakeet after the rule-based cleanup) |                0.111 |       0.138 |           — | —                                              |
+| Qwen3 0.6B, 4-bit (shipped)                      |            **0.093** |   **0.116** |       0.854 | 0.70 / 1.67 / 0.91 / 1.70 s                    |
+| Qwen3 1.7B, 4-bit                                |                0.090 |       0.117 |       0.847 | 0.72 / 0.99 / 0.95 / 1.57 s                    |
+| Qwen3.5 2B, 4-bit                                |                0.086 |       0.111 |       0.861 | 1.19 / 1.52 / 1.46 / 4.18 s                    |
 
-The safety checks matter as much as the model here. An earlier version of the pipeline lost one copy of the intentional phrase `content here, content here` on Lorem Ipsum 3 and inserted stray periods into the stutter recording (`dummy text. of the printing`); both are fixed, and Qwen never made any of the four recordings worse.
+What worked, for all three models:
 
-The same runs measure what the user waits for after release. They were measured with the debug test bundle, where Qwen generates roughly half as fast as in the release app, so the absolute times are conservative.
+- Numbers: dates, durations, percentages, decimals, and phone numbers read digit by digit come out as numerals (`the twenty eighth` → `the 28th`, `zero percent` → `0%`, `twenty four hours` → `24 hours`). On the recording built around dates and phone numbers the formatted error rate fell from 0.234 to 0.093.
+- Stutters, echoes, and partial words are removed, and spoken self-corrections are applied.
+- False starts are removed when the speaker abandons a phrase and restarts it, which the safety checks allow only for short runs that begin like speech and are followed by the start of a clause.
+- Hedging `like` and parenthetical `you know` are removed by rules, because none of the models removed them reliably on their own.
+- Quoted speech gets quotation marks, questions get question marks, and stray capitals inside a sentence are fixed.
 
-| Recording | Words already clean at release | Fn release → final text, previous pipeline | Fn release → final text, now |
-| --- | ---: | ---: | ---: |
-| Lorem Ipsum 1 | 112 of 123 (91%) | 2.026 s | **0.702 s** |
-| Lorem Ipsum 2 (heavy stutter) | 122 of 145 (84%) | 5.590 s | **1.698 s** |
-| Lorem Ipsum 3 | 115 of 146 (79%) | 1.091 s | **0.891 s** |
-| Heavy stutter | 45 of 90 (50%) | 1.744 s | **1.562 s** |
+What did not work, or only partly:
 
-The previous pipeline cleaned sentences inside the audio loop, stopped early cleanup after the first revised word, and retried rejected answers in 220-character chunks; one 73-word tail needed eight serial Qwen calls after release. The current pipeline reuses every sentence that was already clean and usually needs one Qwen call for the tail. The remaining time is dominated by the final Parakeet pass, about 0.47 seconds per minute of audio on this machine; the stutter recording reuses only half its words because its final sentence alone is 45 words long.
+- Sentence-opening connectives (`and`, `so`, `because`, `but`) mostly stay. All three models are conservative here, and rule-based removal agreed with the reference in only 60–70% of cases, so it was left to the model.
+- The reference rewrites grammar (`send` → `sent`, `we'll send` → `will be sent`) and turns spoken enumerations into numbered or bulleted lists. The pipeline does neither by design: it never replaces a recognized word, and it returns prose.
+- Names the recognizer got wrong stay wrong, as intended.
 
-A separate 92.031-second recording with audible stutters and a 156-word reference shows the other side of the same behaviour:
-
-| Measurement | Result |
-| --- | ---: |
-| Parakeet WER | 6.410% |
-| WER after Qwen | 6.410% |
-| Fn release → Parakeet result | 0.588 s |
-| Parakeet result → final text | 0.425 s |
-| Fn release → final text | **1.013 s** |
-| Words safely reused after release | 134 of 157 (85.4%) |
-| Words that still needed cleanup | 23 |
-
-Here Parakeet had already dropped the audible stutters from its own text, so there was nothing for Qwen to remove and it correctly left the words unchanged. The time after release fell from 1.203 s with the previous pipeline to 1.013 s. Whether Qwen changes the word error rate depends on whether the stutters survive speech recognition; the safety checks make sure it never gets worse either way.
+The larger models edit a little more thoroughly, and the 2B model produced the best text on most recordings. The 0.6B model stays the default because it is the fastest and lightest (the 2B more than doubles that time on difficult recording) and because its output is now close enough that the remaining gap is mostly recognition and rewriting rather than cleanup. Any MLX text model can be tried on the same benchmark with `WORDMATE_POST_PROCESSING_MODEL_ID`.
 
 ### Test machine
 
-| Item | Value |
-| --- | --- |
-| Mac | Mac16,5 with Apple M4 Max |
+| Item           | Value                        |
+| -------------- | ---------------------------- |
+| Mac            | Mac16,5 with Apple M4 Max    |
 | CPU and memory | 16 logical cores and 128 GiB |
-| macOS | 15.7.2 (24G325) |
-| Dataset | LibriSpeech SLR12 `test-clean` and `test-other` |
-| Playback | Real time (1×) |
-| Recording selection | Fixed seed `20260901`; recordings at least 5 seconds long |
 
 The model files were already downloaded. Model loading and one warm-up recording were excluded from the timing tables.
 
-These results describe this machine and these recordings. LibriSpeech is read audiobook English, not everyday dictation. Other Macs, microphones, accents, background noise, technical terms, and code-heavy speech can produce different results.
+These results describe this machine and these recordings. LibriSpeech is read audiobook English, not everyday dictation, and the ten dictations are one speaker. Other Macs, microphones, accents, background noise, technical terms, and code-heavy speech can produce different results.
 
 ## Code guide
 
@@ -198,7 +188,8 @@ These results describe this machine and these recordings. LibriSpeech is read au
 - [`ParakeetEngine.swift`](Sources/LocalTranscriber/Transcription/ParakeetEngine.swift) loads Parakeet, runs the cumulative checkpoints, decides which sentences are committed, and produces the final transcript.
 - [`StreamingTranscriptPolisher.swift`](Sources/LocalTranscriber/Transcription/StreamingTranscriptPolisher.swift) queues committed sentences for Qwen, tracks which sentences were already sent, and reuses their results at release.
 - [`TranscriptPostProcessor.swift`](Sources/LocalTranscriber/Transcription/TranscriptPostProcessor.swift) runs Qwen with the shared prompt cache, records every call for diagnostics, and checks each answer.
-- [`TranscriptCleaner.swift`](Sources/LocalTranscriber/Transcription/TranscriptCleaner.swift) and [`PartialWordRetryCleaner.swift`](Sources/LocalTranscriber/Transcription/PartialWordRetryCleaner.swift) apply the rule-based cleanup before Qwen.
+- [`TranscriptCleaner.swift`](Sources/LocalTranscriber/Transcription/TranscriptCleaner.swift), [`DiscourseFillerCleaner.swift`](Sources/LocalTranscriber/Transcription/DiscourseFillerCleaner.swift), and [`PartialWordRetryCleaner.swift`](Sources/LocalTranscriber/Transcription/PartialWordRetryCleaner.swift) apply the rule-based cleanup before Qwen.
+- [`SpokenNumberFormatter.swift`](Sources/LocalTranscriber/Transcription/SpokenNumberFormatter.swift) and [`ParagraphPlanner.swift`](Sources/LocalTranscriber/Transcription/ParagraphPlanner.swift) write numerals and paragraphs after Qwen.
 - [`Tests/`](Tests/LocalTranscriberTests) contains unit tests, model tests, and optional benchmarks.
 
 ## Requirements
@@ -206,65 +197,6 @@ These results describe this machine and these recordings. LibriSpeech is read au
 - Apple silicon Mac
 - macOS 14 or newer
 - Xcode 16 or newer
-
-## Running the tests
-
-The normal test suite does not download models or external audio:
-
-```sh
-swift test
-```
-
-Run the Qwen acceptance examples with:
-
-```sh
-WORDMATE_RUN_MODEL_ACCEPTANCE=1 \
-swift test --filter PostProcessingAcceptanceTests
-```
-
-To repeat the `test-clean` benchmark after downloading the official LibriSpeech data:
-
-```sh
-WORDMATE_RUN_LIBRISPEECH_BENCHMARK=1 \
-WORDMATE_LIBRISPEECH_ROOT=/path/to/LibriSpeech/test-clean \
-WORDMATE_LIBRISPEECH_SPLIT=test-clean \
-WORDMATE_LIBRISPEECH_SAMPLE_COUNT=100 \
-WORDMATE_LIBRISPEECH_MIN_SECONDS=5 \
-WORDMATE_LIBRISPEECH_SEED=20260901 \
-WORDMATE_LIBRISPEECH_REPLAY_SPEED=1 \
-WORDMATE_LIBRISPEECH_REPORT=/tmp/wordmate-test-clean.md \
-swift test -c release --filter LibriSpeechBenchmarkTests
-```
-
-Use `test-other` and a sample count of `50` to repeat the second benchmark. Release builds need MLX's `mlx.metallib` next to the test binary; the debug configuration works without that step.
-
-To play your own recordings through the streaming pipeline in real time, write a JSON manifest with one entry per recording and a plain-text reference transcript:
-
-```json
-[
-  {
-    "name": "my-dictation",
-    "audioPath": "/path/to/recording.m4a",
-    "referencePath": "/path/to/reference.txt"
-  }
-]
-```
-
-```sh
-WORDMATE_RUN_STREAMING_BENCHMARK=1 \
-WORDMATE_STREAMING_BENCHMARK_MANIFEST=/path/to/manifest.json \
-WORDMATE_STREAMING_REPLAY_SPEED=1 \
-WORDMATE_BENCHMARK_PRINT_TRANSCRIPTS=1 \
-swift test --filter StreamingAudioPipelineBenchmarkTests
-```
-
-The output lists, per recording, the word error rates, the time from Fn release to the raw and final transcripts, how many words were reused at release, every Qwen call with its stage, outcome, token counts and timing, and the cost of each Parakeet checkpoint.
-
-Tests that use real models and audio are optional because they can download hundreds of megabytes and take several minutes.
-
-## Source synchronization
-
-This repository is generated from a strict list of files in the private Wordmate workspace. Changes should be made in the main workspace and exported from there instead of being edited separately in this repository.
 
 ## License
 

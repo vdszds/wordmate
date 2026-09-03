@@ -128,6 +128,50 @@ final class TranscriptPolishPolicyTests: XCTestCase {
                 for: "To sail under canvas only would, in rough seas, be difficult."
             )
         )
+        // A false start is abandoned speech followed by a restart; it may go.
+        XCTAssertEqual(
+            TranscriptPolishPolicy.conservativeProjection(
+                of: "I agree we should give examples. But with this prompt the model does nothing.",
+                for: "I agree we should give examples I think we but with this prompt the model does nothing"
+            ),
+            "I agree we should give examples. But with this prompt the model does nothing."
+        )
+        // A phrase followed by ordinary continuation, or ending the text, is
+        // content, and a name inside a deleted run is never a false start.
+        XCTAssertNil(
+            TranscriptPolishPolicy.conservativeProjection(
+                of: "The Extremes of Good and Evil, written in 45 BC.",
+                for: "The Extremes of Good and Evil by Cicero written in 45 BC."
+            )
+        )
+        XCTAssertNil(
+            TranscriptPolishPolicy.conservativeProjection(
+                of: "Neither we nor he knew about the referral program.",
+                for: "Neither we nor he knew about the referral program at the time."
+            )
+        )
+        // Connectives are fillers only before a pronoun-like continuation.
+        XCTAssertNil(
+            TranscriptPolishPolicy.conservativeProjection(
+                of: "Colonel Wheeler, Mr. Mrs. Bill Harmon with Natty.",
+                for: "Colonel Wheeler, Mr. and Mrs. Bill Harmon with Natty."
+            )
+        )
+        XCTAssertEqual(
+            TranscriptPolishPolicy.conservativeProjection(
+                of: "We're back on the 28th. He mentioned that he understood.",
+                for: "we're back on the 28th, and he mentioned that he understood"
+            ),
+            "We're back on the 28th. He mentioned that he understood."
+        )
+        // A phrase lifted from fluent speech is not a false start even when
+        // quoted speech follows it.
+        XCTAssertNil(
+            TranscriptPolishPolicy.conservativeProjection(
+                of: "The Brahmin said, \"Banyan tree, banyan tree, hear and give judgment.\"",
+                for: "the Brahmin said to it, Banyan tree, Banyan tree, hear and give judgment."
+            )
+        )
         XCTAssertNil(
             TranscriptPolishPolicy.conservativeProjection(
                 of: "All I say, kings is kings, and you got to make allowances.",
@@ -200,6 +244,15 @@ final class TranscriptPolishPolicyTests: XCTestCase {
                 for: "Lorem Ipsum Ipsum is simply dummy text text of the printing industry."
             ),
             "Lorem Ipsum is simply dummy text of the printing industry."
+        )
+        // A genuine sentence split between two adjacent source words is kept
+        // and the next word is capitalized instead.
+        XCTAssertEqual(
+            TranscriptPolishPolicy.conservativeProjection(
+                of: "Did you see the report. doesn't it look like the numbers are off?",
+                for: "did you see the report doesn't it look like the numbers are off"
+            ),
+            "Did you see the report. Doesn't it look like the numbers are off?"
         )
         // Source-owned periods and abbreviations stay untouched.
         XCTAssertEqual(
@@ -402,26 +455,22 @@ final class TranscriptPolishPolicyTests: XCTestCase {
 
     func testPromptUsesConciseContextAwareTranscriptEditingInstructions() {
         XCTAssertFalse(TranscriptPolishPolicy.reasoningEnabled)
-        XCTAssertTrue(TranscriptPolishPolicy.instructions.contains("exact adjacent"))
-        XCTAssertTrue(TranscriptPolishPolicy.instructions.contains("Correct only punctuation"))
-        XCTAssertTrue(TranscriptPolishPolicy.instructions.contains("every source word"))
-        XCTAssertTrue(TranscriptPolishPolicy.instructions.contains("Never guess"))
-        XCTAssertTrue(TranscriptPolishPolicy.instructions.contains("do not turn them into numbered lists"))
-        XCTAssertTrue(TranscriptPolishPolicy.instructions.contains("Preserve every sentence and fragment"))
-        XCTAssertTrue(
-            TranscriptPolishPolicy.instructions.contains(
-                "Do not insert punctuation between copies"
-            )
-        )
+        XCTAssertTrue(TranscriptPolishPolicy.instructions.contains("clean written text"))
+        XCTAssertTrue(TranscriptPolishPolicy.instructions.contains("False starts"))
+        XCTAssertTrue(TranscriptPolishPolicy.instructions.contains("Filled pauses and filler words"))
+        XCTAssertTrue(TranscriptPolishPolicy.instructions.contains("Keep every content word exactly as recognized"))
+        XCTAssertTrue(TranscriptPolishPolicy.instructions.contains("never guess"))
+        XCTAssertTrue(TranscriptPolishPolicy.instructions.contains("no lists, no Markdown"))
+        XCTAssertTrue(TranscriptPolishPolicy.instructions.contains("very very good"))
         XCTAssertFalse(TranscriptPolishPolicy.instructions.contains("/no_think"))
         XCTAssertTrue(
             TranscriptPolishPolicy.prompt(for: "hello").contains(
-                "Losslessly polish the transcript"
+                "Edit the dictated transcript below into clean written text"
             )
         )
         XCTAssertTrue(
             TranscriptPolishPolicy.prompt(for: "hello").contains(
-                "do not create lists"
+                "without lists or commentary"
             )
         )
         XCTAssertGreaterThanOrEqual(
@@ -441,16 +490,18 @@ final class TranscriptPolishPolicyTests: XCTestCase {
 
         XCTAssertGreaterThanOrEqual(examples.count, 16)
         XCTAssertEqual(examples.count % 2, 0)
-        XCTAssertTrue(examples.contains("I think we should update this function before merging."))
         XCTAssertTrue(
-            examples.contains("The feature is ready. It works well. Should we release it tomorrow?")
+            examples.contains("I'm just checking in to see if there have been any updates on our order and whether everything is still going according to plan.")
+        )
+        XCTAssertTrue(
+            examples.contains("Did you see the report? Doesn't it look like the numbers are off?")
         )
         XCTAssertTrue(examples.contains("We should deploy on Friday after the tests pass."))
-        XCTAssertTrue(examples.contains("The report has been ready since Monday."))
         XCTAssertTrue(
-            examples.contains(
-                "They left him then, for the courier arrived to unlock the gate and escort them inside."
-            )
+            examples.contains("I agree we should give examples. But with this prompt, the post-processing model essentially does almost nothing. It only removes repeated words.")
+        )
+        XCTAssertTrue(
+            examples.contains("Listen then, Amara, to a story of Rowan, who told it to Elias.")
         )
         XCTAssertFalse(examples.contains { $0.contains("\n1.") })
         XCTAssertEqual(TranscriptPolishPolicy.recoveryHistory.count, 8)

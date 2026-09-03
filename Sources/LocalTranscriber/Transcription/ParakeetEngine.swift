@@ -89,6 +89,13 @@ final class ParakeetEngine {
         _ samples: [Float],
         with manager: AsrManager
     ) async throws -> String {
+        try await transcribeWithTimings(samples, with: manager).transcript
+    }
+
+    private func transcribeWithTimings(
+        _ samples: [Float],
+        with manager: AsrManager
+    ) async throws -> TimedTranscript {
 
         // Each benchmark recording is an independent utterance, so start with
         // a clean decoder state instead of carrying context between runs.
@@ -99,7 +106,40 @@ final class ParakeetEngine {
             samples,
             decoderState: &decoderState
         )
-        return result.text
+        return TimedTranscript(
+            transcript: result.text,
+            pauses: Self.pauses(in: result.tokenTimings ?? [], text: result.text)
+        )
+    }
+
+    /// Silences before word starts. Word starts are the SentencePiece tokens
+    /// carrying the "▁" prefix; when that reconstruction does not reproduce
+    /// the transcript's word count the timings are ignored rather than
+    /// mis-anchored.
+    static let minimumReportedPauseSeconds = 0.35
+
+    static func pauses(in timings: [TokenTiming], text: String) -> [SpeechPause] {
+        guard !timings.isEmpty else { return [] }
+        var pauses: [SpeechPause] = []
+        var wordCount = 0
+        var previousEnd: TimeInterval?
+        for timing in timings {
+            let token = timing.token
+            let startsWord = token.hasPrefix("▁") || token.hasPrefix(" ") || wordCount == 0
+            if startsWord {
+                if let previousEnd, wordCount > 0 {
+                    let gap = timing.startTime - previousEnd
+                    if gap >= minimumReportedPauseSeconds {
+                        pauses.append(SpeechPause(wordIndex: wordCount, seconds: gap))
+                    }
+                }
+                wordCount += 1
+            }
+            previousEnd = max(previousEnd ?? 0, timing.endTime)
+        }
+        let expected = text.split(whereSeparator: \.isWhitespace).count
+        guard wordCount == expected else { return [] }
+        return pauses
     }
 
     func transcribeStreaming(
@@ -107,6 +147,18 @@ final class ParakeetEngine {
         onStableSegment: @escaping @Sendable (StreamingStableRange) async -> Void,
         onCheckpoint: (@Sendable (StreamingCheckpointEvent) -> Void)? = nil
     ) async throws -> String {
+        try await transcribeStreamingWithTimings(
+            audioChunks,
+            onStableSegment: onStableSegment,
+            onCheckpoint: onCheckpoint
+        ).transcript
+    }
+
+    func transcribeStreamingWithTimings(
+        _ audioChunks: AsyncStream<LiveAudioChunk>,
+        onStableSegment: @escaping @Sendable (StreamingStableRange) async -> Void,
+        onCheckpoint: (@Sendable (StreamingCheckpointEvent) -> Void)? = nil
+    ) async throws -> TimedTranscript {
         try await prepare()
         guard let manager else {
             throw LocalTranscriberError.modelCouldNotLoad(
@@ -169,7 +221,7 @@ final class ParakeetEngine {
         let finalSamples = try accumulator.mono16kSamples()
 
         let finalStarted = clock.now
-        let finalTranscript = try await transcribe(finalSamples, with: manager)
+        let finalTranscript = try await transcribeWithTimings(finalSamples, with: manager)
         let finalFinished = clock.now
         onCheckpoint?(
             StreamingCheckpointEvent(
