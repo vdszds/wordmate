@@ -1,5 +1,5 @@
 {
-  "originHash" : "c70827643510301c6f19e134cb755ba8f4e018696400051e2f74a92c7789872f",
+  "originHash" : "0bca536a5e8c863ff3c9bc82f933db882a0553f1de53cc56be64abef00ad7f71",
   "pins" : [
     {
       "identity" : "fluidaudio",
@@ -25,6 +25,15 @@
       "location" : "https://github.com/ml-explore/mlx-swift-lm.git",
       "state" : {
         "revision" : "10628974fa6f996bb1ca9791dd93113292b79e3b"
+      }
+    },
+    {
+      "identity" : "sparkle",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/sparkle-project/Sparkle.git",
+      "state" : {
+        "revision" : "ac2def288cbff5cfc7df3ffef6abdf45b72bcb0a",
+        "version" : "2.9.6"
       }
     },
     {

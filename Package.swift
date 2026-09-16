@@ -3,13 +3,13 @@
 import PackageDescription
 
 let package = Package(
-    name: "WordmateTranscription",
+    name: "LocalTranscriber",
     platforms: [
         .macOS(.v14),
     ],
     products: [
-        .library(
-            name: "WordmateTranscription",
+        .executable(
+            name: "LocalTranscriber",
             targets: ["LocalTranscriber"]
         ),
     ],
@@ -17,6 +17,10 @@ let package = Package(
         .package(
             url: "https://github.com/FluidInference/FluidAudio.git",
             exact: "0.15.6"
+        ),
+        .package(
+            url: "https://github.com/sparkle-project/Sparkle.git",
+            exact: "2.9.6"
         ),
         .package(
             url: "https://github.com/ml-explore/mlx-swift-lm.git",
@@ -28,10 +32,11 @@ let package = Package(
         ),
     ],
     targets: [
-        .target(
+        .executableTarget(
             name: "LocalTranscriber",
             dependencies: [
                 .product(name: "FluidAudio", package: "FluidAudio"),
+                .product(name: "Sparkle", package: "Sparkle"),
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
                 .product(name: "Hub", package: "swift-transformers"),
@@ -39,6 +44,8 @@ let package = Package(
             path: "Sources/LocalTranscriber",
             linkerSettings: [
                 .linkedFramework("Accelerate"),
+                .linkedFramework("AppKit"),
+                .linkedFramework("ApplicationServices"),
                 .linkedFramework("AudioToolbox"),
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("CoreAudio"),
