@@ -27,6 +27,20 @@ actor ModelRunner {
         }
     }
 
+    func transcribeFile(
+        _ samples: [Float],
+        using engine: EngineChoice,
+        progressHandler: @escaping @Sendable (Double) -> Void
+    ) async throws -> String {
+        switch engine {
+        case .parakeet:
+            return try await parakeet.transcribeFile(
+                samples,
+                progressHandler: progressHandler
+            )
+        }
+    }
+
     func transcribeStreaming(
         _ audioChunks: AsyncStream<LiveAudioChunk>,
         using engine: EngineChoice,

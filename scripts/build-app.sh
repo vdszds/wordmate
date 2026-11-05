@@ -31,6 +31,9 @@ mkdir -p "$SWIFTPM_WORK_DIR/clang-modules"
 export CLANG_MODULE_CACHE_PATH="$SWIFTPM_WORK_DIR/clang-modules"
 
 SWIFT_FLAGS=(
+    # Xcode 27 defaults to the swiftbuild engine, which tries to compile MLX's
+    # Metal sources itself. This script builds that shader library below.
+    --build-system native
     --disable-sandbox
     --disable-keychain
     --cache-path "$SWIFTPM_WORK_DIR/cache"

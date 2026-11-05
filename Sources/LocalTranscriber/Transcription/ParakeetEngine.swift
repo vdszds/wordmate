@@ -85,6 +85,33 @@ final class ParakeetEngine {
         return try await transcribe(samples, with: manager)
     }
 
+    /// Transcribes a complete file on a manager of its own, so a file that
+    /// takes minutes never shares a progress stream or an actor queue with a
+    /// live dictation. The Core ML models are safe to share; FluidAudio's own
+    /// chunk workers share them the same way.
+    func transcribeFile(
+        _ samples: [Float],
+        progressHandler: @escaping @Sendable (Double) -> Void
+    ) async throws -> String {
+        try await prepare()
+        guard let models else {
+            throw LocalTranscriberError.modelCouldNotLoad("Parakeet has not been prepared.")
+        }
+
+        let fileManager = AsrManager(config: .default)
+        try await fileManager.loadModels(models)
+
+        let progressStream = await fileManager.transcriptionProgressStream
+        let progressTask = Task {
+            for try await progress in progressStream {
+                progressHandler(progress)
+            }
+        }
+        defer { progressTask.cancel() }
+
+        return try await transcribe(samples, with: fileManager)
+    }
+
     private func transcribe(
         _ samples: [Float],
         with manager: AsrManager

@@ -105,6 +105,7 @@ actor StreamingTranscriptPolisher {
     private let isEnabled: Bool
     private let model: PostProcessingModel
     private let processor: any TranscriptPolishing
+    private let onSegmentPolished: (@Sendable (_ polished: Int, _ total: Int) -> Void)?
 
     private var polishedSegments: [Segment] = []
     private var queue: [QueuedSegment] = []
@@ -117,11 +118,13 @@ actor StreamingTranscriptPolisher {
     init(
         isEnabled: Bool,
         model: PostProcessingModel,
-        processor: any TranscriptPolishing
+        processor: any TranscriptPolishing,
+        onSegmentPolished: (@Sendable (_ polished: Int, _ total: Int) -> Void)? = nil
     ) {
         self.isEnabled = isEnabled
         self.model = model
         self.processor = processor
+        self.onSegmentPolished = onSegmentPolished
     }
 
     /// Accepts contiguous stable text. Context halos are derived from the
@@ -320,8 +323,9 @@ actor StreamingTranscriptPolisher {
         pendingSegment = nil
     }
 
-    /// Waits until every queued segment has been polished. Used by tests;
-    /// production code never blocks the audio loop on the language model.
+    /// Waits until every queued segment has been polished. Used by tests and
+    /// by file transcription; the live audio loop never blocks on the language
+    /// model.
     func waitForQueuedWork() async {
         while let worker {
             await worker.value
@@ -354,6 +358,10 @@ actor StreamingTranscriptPolisher {
             )
             polishedSegments.append(
                 Segment(source: segment.source, polished: polished)
+            )
+            onSegmentPolished?(
+                polishedSegments.count,
+                polishedSegments.count + queue.count
             )
         } catch {
             // The recording continues uninterrupted. finalize() will detect the

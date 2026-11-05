@@ -29,6 +29,7 @@ Parakeet TDT v3 handles speech recognition on-device, with optional Qwen3 post-p
 
 - System-wide voice typing with automatic pasting
 - Push-to-talk and hands-free recording from the Fn key
+- Audio and video file transcription with drag and drop
 - Local transcription in 25 European languages
 - Optional on-device transcript cleanup
 - Built-in and external microphone selection

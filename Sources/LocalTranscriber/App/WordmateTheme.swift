@@ -32,6 +32,15 @@ private struct WordmateSurfaceModifier: ViewModifier {
                     style: .continuous
                 )
             )
+            // Current SDKs resolve the window and control backgrounds to the
+            // same color, so the fill alone no longer sets a surface apart.
+            .overlay {
+                RoundedRectangle(
+                    cornerRadius: cornerRadius,
+                    style: .continuous
+                )
+                .strokeBorder(WordmateTheme.controlBorder, lineWidth: 1)
+            }
             .shadow(
                 color: shadow ? WordmateTheme.shadow.opacity(0.12) : .clear,
                 radius: shadow ? 12 : 0,

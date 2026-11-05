@@ -19,6 +19,9 @@ enum LocalTranscriberError: LocalizedError {
     case modelChecksumMismatch
     case modelCouldNotLoad(String)
     case transcriptionFailed(String)
+    case unsupportedAudioFile(String)
+    case noAudioTrack(String)
+    case audioFileTooShort
 
     var errorDescription: String? {
         switch self {
@@ -58,6 +61,12 @@ enum LocalTranscriberError: LocalizedError {
             return "The model could not be loaded: \(reason)"
         case let .transcriptionFailed(reason):
             return "Transcription failed: \(reason)"
+        case let .unsupportedAudioFile(name):
+            return "“\(name)” isn’t in a format this Mac can read. Try MP3, M4A, WAV, or FLAC."
+        case let .noAudioTrack(name):
+            return "“\(name)” doesn’t have any audio to transcribe."
+        case .audioFileTooShort:
+            return "This file is too short to transcribe."
         }
     }
 }

@@ -389,6 +389,46 @@ final class StreamingTranscriptPolisherTests: XCTestCase {
     }
 }
 
+extension StreamingTranscriptPolisherTests {
+    func testReportsProgressAsEachQueuedSegmentIsPolished() async {
+        let processor = RecordingTranscriptPolisher()
+        let reports = PolishProgressLog()
+        let polisher = StreamingTranscriptPolisher(
+            isEnabled: true,
+            model: .qwen3_0_6b,
+            processor: processor
+        ) { polished, total in
+            reports.append(polished: polished, total: total)
+        }
+
+        await polisher.consumeStableSegment(
+            StreamingStableRange(
+                source: "The first sentence is here now. The second sentence follows it closely. The third one ends this.",
+                precedingContext: "",
+                followingContext: ""
+            )
+        )
+        await polisher.waitForQueuedWork()
+
+        let entries = reports.entries
+        XCTAssertEqual(entries.map(\.polished), [1, 2, 3])
+        XCTAssertEqual(entries.last?.total, 3)
+    }
+}
+
+private final class PolishProgressLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [(polished: Int, total: Int)] = []
+
+    var entries: [(polished: Int, total: Int)] {
+        lock.withLock { storage }
+    }
+
+    func append(polished: Int, total: Int) {
+        lock.withLock { storage.append((polished, total)) }
+    }
+}
+
 private actor RecordingTranscriptPolisher: TranscriptPolishing {
     struct StreamingCall: Sendable {
         let transcript: String

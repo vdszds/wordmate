@@ -25,6 +25,17 @@ final class AppCoordinator: NSObject {
     private lazy var pillWindowController = PillWindowController(
         controller: dictationController
     )
+    private lazy var fileTranscriptionViewModel = FileTranscriptionViewModel(
+        transcriber: AudioFileTranscriber(
+            modelRunner: modelRunner,
+            processor: transcriptPostProcessor,
+            engine: .parakeet,
+            postProcessingModel: .qwen3_0_6b
+        ),
+        preferences: preferences,
+        readiness: postProcessingReadiness,
+        usageStatistics: usageStatistics
+    )
 
     private var onboardingWindow: NSWindow?
     private var onboardingViewModel: OnboardingViewModel?
@@ -45,6 +56,7 @@ final class AppCoordinator: NSObject {
     func stop() {
         stopShortcutMonitoring()
         dictationController.stop()
+        fileTranscriptionViewModel.cancel()
         pillWindowController.close()
         removeStatusItem()
         homeWindow?.close()
@@ -64,6 +76,7 @@ final class AppCoordinator: NSObject {
     func showOnboarding() {
         stopShortcutMonitoring()
         dictationController.stop()
+        fileTranscriptionViewModel.cancel()
         pillWindowController.hide()
         removeStatusItem()
         homeWindow?.orderOut(nil)
@@ -171,7 +184,7 @@ final class AppCoordinator: NSObject {
         homeViewModel = viewModel
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
+            contentRect: NSRect(x: 0, y: 0, width: 600, height: 460),
             styleMask: [
                 .titled,
                 .closable,
@@ -193,7 +206,8 @@ final class AppCoordinator: NSObject {
             rootView: HomeView(
                 viewModel: viewModel,
                 statistics: usageStatistics,
-                updater: appUpdater
+                updater: appUpdater,
+                fileTranscription: fileTranscriptionViewModel
             )
         )
         window.center()

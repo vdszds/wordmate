@@ -9,4 +9,5 @@ enum WordmateLog {
     static let subsystem = "sh.wordmate.app"
     static let audio = Logger(subsystem: subsystem, category: "audio")
     static let dictation = Logger(subsystem: subsystem, category: "dictation")
+    static let fileTranscription = Logger(subsystem: subsystem, category: "file-transcription")
 }
